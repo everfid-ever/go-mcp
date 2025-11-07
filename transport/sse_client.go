@@ -153,6 +153,12 @@ func (t *sseClientTransport) startSSE() error {
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")
 
+	if t.tokenProvider != nil {
+		if token := t.tokenProvider(); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+
 	resp, err := t.client.Do(req) //nolint:bodyclose
 	if err != nil {
 		return fmt.Errorf("failed to connect to SSE stream: %w", err)

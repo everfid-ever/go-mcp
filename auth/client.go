@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,22 +22,24 @@ type OAuthClient struct {
 	config        *ThirdPartyOAuthConfig
 	mcpTokenGen   *TokenGenerator
 	store         Store
-	stateStore    map[string]*OAuthState // In-memory state storage
+	stateStore    map[string]*OAuthState
 	httpClient    *http.Client
-	encryptionKey []byte // For encrypting sensitive tokens
+	encryptionKey []byte
+	stateMutex    sync.RWMutex
+	encryptMutex  sync.RWMutex
 }
 
-// OAuthState stores temporary OAuth flow state - FIXED: Added MCP client parameters
+// OAuthState stores temporary OAuth flow state
 type OAuthState struct {
 	State           string
-	CodeVerifier    string // For PKCE
+	CodeVerifier    string
 	CodeChallenge   string
 	RedirectURI     string
-	OriginalRequest string // Store original MCP client callback
+	OriginalRequest string
 	CreatedAt       time.Time
 	ExpiresAt       time.Time
 
-	// MCP Client parameters - NEW
+	// MCP Client parameters
 	MCPClientID            string
 	MCPRedirectURI         string
 	MCPScopes              []string
@@ -51,11 +54,11 @@ func NewOAuthClient(
 	config *ThirdPartyOAuthConfig,
 	mcpTokenGen *TokenGenerator,
 	store Store,
-) *OAuthClient {
-	// Generate encryption key for sensitive data (in production, load from secure config)
+) (*OAuthClient, error) {
+	// Generate encryption key for sensitive data
 	encryptionKey := make([]byte, 32)
 	if _, err := rand.Read(encryptionKey); err != nil {
-		panic(fmt.Sprintf("failed to generate encryption key: %v", err))
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
 	}
 
 	return &OAuthClient{
@@ -65,11 +68,10 @@ func NewOAuthClient(
 		stateStore:    make(map[string]*OAuthState),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 		encryptionKey: encryptionKey,
-	}
+	}, nil
 }
 
 // InitiateOAuthFlow handles the initial OAuth request from MCP Client
-// FIXED: Now properly captures MCP client parameters
 func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) {
 	// Extract MCP client parameters
 	mcpClientID := r.URL.Query().Get("client_id")
@@ -78,7 +80,7 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 	mcpScope := r.URL.Query().Get("scope")
 	mcpCodeChallenge := r.URL.Query().Get("code_challenge")
 	mcpCodeChallengeMethod := r.URL.Query().Get("code_challenge_method")
-	mcpResources := r.URL.Query()["resource"] // Can be repeated
+	mcpResources := r.URL.Query()["resource"]
 
 	// Validate required MCP parameters
 	if mcpClientID == "" {
@@ -97,7 +99,7 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Validate redirect URI
+	// Validate redirect URI (exact match per MCP spec)
 	validRedirect := false
 	for _, allowed := range client.RedirectURIs {
 		if mcpRedirectURI == allowed {
@@ -113,7 +115,7 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 	// Parse scopes
 	mcpScopes := parseScopes(mcpScope)
 
-	// Generate state for CSRF protection (for third-party OAuth)
+	// Generate state for CSRF protection
 	state, err := generateRandomState()
 	if err != nil {
 		http.Error(w, "Failed to generate state", http.StatusInternalServerError)
@@ -148,7 +150,10 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 		MCPCodeChallenge:       mcpCodeChallenge,
 		MCPCodeChallengeMethod: mcpCodeChallengeMethod,
 	}
+
+	c.stateMutex.Lock()
 	c.stateStore[state] = oauthState
+	c.stateMutex.Unlock()
 
 	// Build authorization URL for third-party provider
 	authURL := c.buildAuthorizationURL(state, codeChallenge)
@@ -158,7 +163,6 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleCallback handles the callback from third-party OAuth provider
-// FIXED: Now generates proper MCP authorization code with all parameters
 func (c *OAuthClient) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Extract authorization code and state
 	code := r.URL.Query().Get("code")
@@ -178,7 +182,10 @@ func (c *OAuthClient) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate state
+	c.stateMutex.RLock()
 	oauthState, ok := c.stateStore[state]
+	c.stateMutex.RUnlock()
+
 	if !ok {
 		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
 		return
@@ -186,42 +193,45 @@ func (c *OAuthClient) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Check state expiration
 	if time.Now().After(oauthState.ExpiresAt) {
+		c.stateMutex.Lock()
 		delete(c.stateStore, state)
+		c.stateMutex.Unlock()
 		http.Error(w, "State expired", http.StatusBadRequest)
 		return
 	}
 
 	// Clean up used state
+	c.stateMutex.Lock()
 	delete(c.stateStore, state)
+	c.stateMutex.Unlock()
 
 	// Exchange authorization code for access token from third-party
 	thirdPartyToken, err := c.exchangeCodeForToken(code, oauthState.CodeVerifier)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to exchange code: %v", err), http.StatusInternalServerError)
+		http.Error(w, "Failed to exchange code", http.StatusInternalServerError)
 		return
 	}
 
 	// Get user info from third-party
 	userInfo, err := c.getUserInfo(thirdPartyToken.AccessToken)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get user info: %v", err), http.StatusInternalServerError)
+		http.Error(w, "Failed to get user info", http.StatusInternalServerError)
 		return
 	}
 
 	// Generate MCP authorization code with proper parameters
 	mcpAuthCode, err := c.generateMCPAuthorizationCode(r.Context(), oauthState, userInfo, thirdPartyToken)
 	if err != nil {
-		http.Error(w, "Failed to generate MCP auth code", http.StatusInternalServerError)
+		http.Error(w, "Failed to complete authorization", http.StatusInternalServerError)
 		return
 	}
 
-	// Redirect back to MCP client with MCP authorization code and original state
+	// Redirect back to MCP client with MCP authorization code
 	redirectURL := c.buildMCPClientRedirect(oauthState.MCPRedirectURI, mcpAuthCode, oauthState.MCPState)
 	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
 // generateMCPAuthorizationCode generates a proper MCP authorization code
-// FIXED: Now includes all MCP client parameters
 func (c *OAuthClient) generateMCPAuthorizationCode(
 	ctx context.Context,
 	oauthState *OAuthState,
@@ -256,20 +266,20 @@ func (c *OAuthClient) generateMCPAuthorizationCode(
 	// Create authorization code with proper MCP client binding
 	authCode := &AuthorizationCode{
 		Code:                code,
-		ClientID:            oauthState.MCPClientID, // FIXED: Use MCP client ID
+		ClientID:            oauthState.MCPClientID,
 		UserID:              userInfo.Subject,
-		RedirectURI:         oauthState.MCPRedirectURI,   // FIXED: Use MCP redirect URI
-		Scopes:              oauthState.MCPScopes,        // FIXED: Use MCP scopes
-		Resources:           oauthState.MCPResources,     // FIXED: Use MCP resources
-		CodeChallenge:       oauthState.MCPCodeChallenge, // FIXED: Use MCP PKCE
+		RedirectURI:         oauthState.MCPRedirectURI,
+		Scopes:              oauthState.MCPScopes,
+		Resources:           oauthState.MCPResources,
+		CodeChallenge:       oauthState.MCPCodeChallenge,
 		CodeChallengeMethod: challengeMethod,
 		ExpiresAt:           time.Now().Add(5 * time.Minute),
 		CreatedAt:           time.Now(),
 		Used:                false,
 		Metadata: map[string]interface{}{
 			"third_party_provider":          c.config.ProviderName,
-			"third_party_token_encrypted":   encryptedAccessToken,  // FIXED: Encrypted
-			"third_party_refresh_encrypted": encryptedRefreshToken, // FIXED: Encrypted
+			"third_party_token_encrypted":   encryptedAccessToken,
+			"third_party_refresh_encrypted": encryptedRefreshToken,
 			"third_party_expires":           time.Now().Add(time.Duration(thirdPartyToken.ExpiresIn) * time.Second).Unix(),
 			"user_email":                    userInfo.Email,
 			"user_name":                     userInfo.Name,
@@ -288,6 +298,9 @@ func (c *OAuthClient) encryptToken(plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", nil
 	}
+
+	c.encryptMutex.RLock()
+	defer c.encryptMutex.RUnlock()
 
 	block, err := aes.NewCipher(c.encryptionKey)
 	if err != nil {
@@ -313,6 +326,9 @@ func (c *OAuthClient) decryptToken(encrypted string) (string, error) {
 	if encrypted == "" {
 		return "", nil
 	}
+
+	c.encryptMutex.RLock()
+	defer c.encryptMutex.RUnlock()
 
 	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
 	if err != nil {
@@ -344,7 +360,6 @@ func (c *OAuthClient) decryptToken(encrypted string) (string, error) {
 
 // exchangeCodeForToken exchanges authorization code for access token
 func (c *OAuthClient) exchangeCodeForToken(code, codeVerifier string) (*ThirdPartyTokenResponse, error) {
-	// Build token request
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
@@ -356,7 +371,6 @@ func (c *OAuthClient) exchangeCodeForToken(code, codeVerifier string) (*ThirdPar
 		data.Set("code_verifier", codeVerifier)
 	}
 
-	// Make token request
 	req, err := http.NewRequest(http.MethodPost, c.config.TokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
@@ -376,7 +390,6 @@ func (c *OAuthClient) exchangeCodeForToken(code, codeVerifier string) (*ThirdPar
 		return nil, fmt.Errorf("token request failed: %d - %s", resp.StatusCode, string(body))
 	}
 
-	// Parse token response
 	var tokenResp ThirdPartyTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return nil, err
@@ -388,7 +401,6 @@ func (c *OAuthClient) exchangeCodeForToken(code, codeVerifier string) (*ThirdPar
 // getUserInfo fetches user information from third-party
 func (c *OAuthClient) getUserInfo(accessToken string) (*ThirdPartyUserInfo, error) {
 	if c.config.UserInfoURL == "" {
-		// No userinfo endpoint, return minimal info
 		return &ThirdPartyUserInfo{
 			Subject: "unknown",
 			Claims:  make(map[string]interface{}),
@@ -414,7 +426,6 @@ func (c *OAuthClient) getUserInfo(accessToken string) (*ThirdPartyUserInfo, erro
 		return nil, fmt.Errorf("userinfo request failed: %d - %s", resp.StatusCode, string(body))
 	}
 
-	// Parse userinfo response
 	var userInfo ThirdPartyUserInfo
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -425,7 +436,6 @@ func (c *OAuthClient) getUserInfo(accessToken string) (*ThirdPartyUserInfo, erro
 		return nil, err
 	}
 
-	// Parse additional claims
 	var claims map[string]interface{}
 	if err := json.Unmarshal(body, &claims); err == nil {
 		userInfo.Claims = claims
@@ -452,13 +462,12 @@ func (c *OAuthClient) buildAuthorizationURL(state, codeChallenge string) string 
 }
 
 // buildMCPClientRedirect builds redirect URL back to MCP client
-// FIXED: Use MCP client's original state
 func (c *OAuthClient) buildMCPClientRedirect(mcpClientCallback, authCode, mcpState string) string {
 	redirectURL, _ := url.Parse(mcpClientCallback)
 	query := redirectURL.Query()
 	query.Set("code", authCode)
 	if mcpState != "" {
-		query.Set("state", mcpState) // FIXED: Return MCP client's state
+		query.Set("state", mcpState)
 	}
 	redirectURL.RawQuery = query.Encode()
 	return redirectURL.String()

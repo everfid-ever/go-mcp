@@ -159,3 +159,24 @@ const (
 	ErrTemporarilyUnavailable  = "temporarily_unavailable"
 	ErrInvalidToken            = "invalid_token"
 )
+
+// MCP Protocol Constants
+const (
+	// CurrentMCPVersion is the MCP protocol version this implementation supports
+	CurrentMCPVersion = "2024-11-05"
+
+	// MCPProtocolVersionHeader is the header name for MCP protocol version
+	MCPProtocolVersionHeader = "MCP-Protocol-Version"
+
+	// MCP Resource URI schemes (RFC 8707)
+	MCPResourceSchemeTools     = "mcp://tools"
+	MCPResourceSchemePrompts   = "mcp://prompts"
+	MCPResourceSchemeResources = "mcp://resources"
+)
+
+// DefaultMCPResources indicators
+var DefaultMCPResources = []string{
+	MCPResourceSchemeTools,
+	MCPResourceSchemePrompts,
+	MCPResourceSchemeResources,
+}

@@ -45,10 +45,16 @@ func WithLogger(logger pkg.Logger) Option {
 	}
 }
 
-func WithAuth(token string, expiry time.Time) Option {
+func WithAuthAndRefresher(
+	accessToken, refreshToken string,
+	expiry time.Time,
+	refresher func(string) (string, string, time.Time, error),
+) Option {
 	return func(c *Client) {
-		c.accessToken = token
+		c.accessToken = accessToken
+		c.refreshToken = refreshToken
 		c.tokenExpiry = expiry
+		c.tokenRefresher = refresher
 	}
 }
 
@@ -82,9 +88,11 @@ type Client struct {
 
 	logger pkg.Logger
 
-	accessToken string
-	tokenExpiry time.Time
-	tokenMutex  sync.RWMutex
+	accessToken    string
+	refreshToken   string
+	tokenExpiry    time.Time
+	tokenMutex     sync.RWMutex
+	tokenRefresher func(refreshToken string) (accessToken, newRefreshToken string, expiry time.Time, err error)
 }
 
 func NewClient(t transport.ClientTransport, opts ...Option) (*Client, error) {
@@ -179,21 +187,37 @@ func (client *Client) sessionDetection() {
 	}
 }
 
-func (c *Client) SetAccessToken(token string, expiry time.Time) {
-	c.tokenMutex.Lock()
-	defer c.tokenMutex.Unlock()
-
-	c.accessToken = token
-	c.tokenExpiry = expiry
-}
-
 func (c *Client) GetAccessToken() (string, bool) {
 	c.tokenMutex.RLock()
-	defer c.tokenMutex.RUnlock()
 
-	if time.Now().After(c.tokenExpiry) {
+	if time.Now().Before(c.tokenExpiry) {
+		token := c.accessToken
+		c.tokenMutex.RUnlock()
+		return token, true
+	}
+
+	c.tokenMutex.RUnlock()
+
+	if c.tokenRefresher == nil {
 		return "", false
 	}
 
-	return c.accessToken, true
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+
+	if time.Now().Before(c.tokenExpiry) {
+		return c.accessToken, true
+	}
+
+	newAccessToken, newRefreshToken, newExpiry, err := c.tokenRefresher(c.refreshToken)
+	if err != nil {
+		c.logger.Errorf("Failed to refresh token: %v", err)
+		return "", false
+	}
+
+	c.accessToken = newAccessToken
+	c.refreshToken = newRefreshToken
+	c.tokenExpiry = newExpiry
+
+	return newAccessToken, true
 }

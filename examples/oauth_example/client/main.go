@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,166 +13,265 @@ import (
 	"net/url"
 	"strings"
 	"time"
-)
 
-const (
-	clientID    = "mcp-client-demo"
-	redirectURI = "http://localhost:9999/callback"
-	authURL     = "http://localhost:8080/oauth/authorize"
-	tokenURL    = "http://localhost:8080/oauth/token"
+	"github.com/ThinkInAIXYZ/go-mcp/client"
+	"github.com/ThinkInAIXYZ/go-mcp/protocol"
+	"github.com/ThinkInAIXYZ/go-mcp/transport"
 )
 
 func main() {
-	log.Println("🚀 Starting MCP Client Example...")
+	log.Println("🚀 OAuth Client Demo")
 
-	// 1. Generate PKCE parameters
+	// Step 1: OAuth Authorization Flow
+	log.Println("\n📋 Step 1: Getting OAuth token...")
 	codeVerifier, codeChallenge := generatePKCE()
-	log.Printf("🔐 Generated PKCE: verifier=%s... challenge=%s...",
-		codeVerifier[:10], codeChallenge[:10])
+	state := randomString(16)
 
-	// 2. Start a local callback server
-	authCodeChan := make(chan string, 1)
-	go startCallbackServer(authCodeChan)
+	// Start callback server
+	codeChan := make(chan string, 1)
+	go startCallback(codeChan)
+	time.Sleep(500 * time.Millisecond)
 
-	time.Sleep(500 * time.Millisecond) // Wait for the server to start
+	// Build authorization URL
+	authURL := fmt.Sprintf(
+		"http://localhost:8080/oauth/authorize?response_type=code&client_id=demo-client&redirect_uri=http://localhost:9999/callback&scope=read&state=%s&code_challenge=%s&code_challenge_method=S256",
+		state, codeChallenge,
+	)
 
-	// 3. Build the authorization URL
-	state := generateState()
-	authorizeURL := buildAuthorizeURL(codeChallenge, state)
+	log.Printf("📋 Authorization URL:\n   %s\n", authURL)
+	log.Println("⏳ Waiting for authorization...")
 
-	log.Println("\n📋 Step 1: Open this URL in browser (or auto-requesting):")
-	log.Printf("   %s\n", authorizeURL)
-
+	// Simulate a browser visit
 	go func() {
-		resp, err := http.Get(authorizeURL)
+		time.Sleep(100 * time.Millisecond)
+		resp, err := http.Get(authURL)
 		if err != nil {
-			log.Printf("❌ Auto-request failed: %v", err)
+			log.Printf("❌ Authorization request failed: %v", err)
 			return
 		}
 		defer resp.Body.Close()
-		log.Printf("✅ Authorization redirected to callback")
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("❌ Authorization failed (%d): %s", resp.StatusCode, string(body))
+		}
 	}()
 
-	// 5. Wait for the authorization code
-	log.Println("\n⏳ Waiting for authorization code...")
-	authCode := <-authCodeChan
-	log.Printf("✅ Received authorization code: %s...\n", authCode[:20])
+	// Add timeout protection
+	select {
+	case code := <-codeChan:
+		if code == "" {
+			log.Fatal("❌ Received empty authorization code")
+		}
+		log.Printf("✅ Got authorization code: %s...\n", code[:min(10, len(code))])
 
-	// 6. Exchange authorization code for access token
-	accessToken, refreshToken := exchangeToken(authCode, codeVerifier)
+		// Exchange authorization code for tokens
+		accessToken, refreshToken := exchangeToken(code, codeVerifier)
+		if accessToken == "" {
+			log.Fatal("❌ Failed to get access token")
+		}
+		log.Printf("✅ Got access token: %s...\n", accessToken[:min(20, len(accessToken))])
 
-	log.Println("\n🎉 OAuth Flow Complete!")
-	log.Printf("   Access Token:  %s...", accessToken[:30])
-	log.Printf("   Refresh Token: %s...", refreshToken[:30])
+		// Step 2: Connect to MCP with token
+		log.Println("\n📋 Step 2: Connecting to MCP with token...")
 
-	// 7. Simulate MCP tool calls (simplified, actual calls require SSE connection)
-	log.Println("\n📞 Simulating MCP tool calls with access token...")
-	testToolAccess(accessToken)
+		sseTransport, err := transport.NewSSEClientTransport(
+			"http://localhost:8080/mcp",
+			transport.WithSSEClientTransportAuthToken(func() string {
+				return accessToken
+			}),
+		)
+		if err != nil {
+			log.Fatalf("❌ Failed to create transport: %v", err)
+		}
 
-	log.Println("\n✅ Example completed! Press Ctrl+C to exit.")
-	select {} // Keep the program running
+		mcpClient, err := client.NewClient(sseTransport,
+			client.WithAuthAndRefresher(
+				accessToken,
+				refreshToken,
+				time.Now().Add(15*time.Minute),
+				func(rt string) (string, string, time.Time, error) {
+					log.Println("🔄 Refreshing token...")
+					newAccess, newRefresh := refreshToken_(rt)
+					return newAccess, newRefresh, time.Now().Add(15 * time.Minute), nil
+				},
+			),
+		)
+		if err != nil {
+			log.Fatalf("❌ Failed to create MCP client: %v", err)
+		}
+		defer mcpClient.Close()
+
+		log.Println("✅ Connected to MCP Server")
+
+		// Step 3: Call a registered tool
+		log.Println("\n📋 Step 3: Calling tool...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := mcpClient.CallTool(ctx, &protocol.CallToolRequest{
+			Name: "echo",
+			Arguments: map[string]interface{}{
+				"message": "Hello OAuth!",
+			},
+		})
+
+		if err != nil {
+			log.Fatalf("❌ Tool call failed: %v", err)
+		}
+
+		if len(result.Content) > 0 {
+			if textContent, ok := result.Content[0].(*protocol.TextContent); ok {
+				log.Printf("✅ Result: %s\n", textContent.Text)
+			}
+		}
+
+		log.Println("\n✅ Demo completed!")
+		log.Println("   Press Ctrl+C to exit")
+		select {}
+
+	case <-time.After(10 * time.Second):
+		log.Fatal("❌ Timeout waiting for authorization code")
+	}
 }
 
-// generatePKCE creates PKCE parameters (verifier and challenge)
+// ========== Helper Functions ==========
+
+// min returns the smaller of two integers.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// generatePKCE creates a PKCE code verifier and its corresponding challenge.
 func generatePKCE() (verifier, challenge string) {
 	b := make([]byte, 32)
 	rand.Read(b)
 	verifier = base64.RawURLEncoding.EncodeToString(b)
 
-	h := sha256.New()
-	h.Write([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-
-	return verifier, challenge
+	h := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(h[:])
+	return
 }
 
-// generateState creates a random state value to protect against CSRF attacks
-func generateState() string {
-	b := make([]byte, 16)
+// randomString generates a random URL-safe string of length n.
+func randomString(n int) string {
+	b := make([]byte, n)
 	rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	result := base64.RawURLEncoding.EncodeToString(b)
+	if len(result) > n {
+		return result[:n]
+	}
+	return result
 }
 
-// buildAuthorizeURL constructs the full OAuth 2.1 authorization URL
-func buildAuthorizeURL(codeChallenge, state string) string {
-	params := url.Values{}
-	params.Set("response_type", "code")
-	params.Set("client_id", clientID)
-	params.Set("redirect_uri", redirectURI)
-	params.Set("scope", "read write") // Request read and write permissions
-	params.Set("state", state)
-	params.Set("code_challenge", codeChallenge)
-	params.Set("code_challenge_method", "S256")
-
-	return authURL + "?" + params.Encode()
-}
-
-// startCallbackServer starts a local HTTP server to receive the authorization callback
-func startCallbackServer(authCodeChan chan string) {
+// startCallback starts a local HTTP server to handle OAuth redirect responses.
+func startCallback(codeChan chan string) {
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
-		state := r.URL.Query().Get("state")
+		errorCode := r.URL.Query().Get("error")
 
-		if code == "" {
-			http.Error(w, "Missing authorization code", http.StatusBadRequest)
+		if errorCode != "" {
+			errorDesc := r.URL.Query().Get("error_description")
+			log.Printf("❌ Authorization error: %s - %s", errorCode, errorDesc)
+			fmt.Fprintf(w, "❌ Authorization failed: %s", errorDesc)
+			codeChan <- ""
 			return
 		}
 
-		log.Printf("✅ Callback received: code=%s... state=%s", code[:20], state)
+		if code == "" {
+			log.Println("❌ No authorization code received")
+			fmt.Fprintf(w, "❌ No authorization code received")
+			codeChan <- ""
+			return
+		}
 
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `
-			<html>
-			<body>
-				<h2>✅ Authorization Successful!</h2>
-				<p>You can close this window and return to the terminal.</p>
-			</body>
-			</html>
-		`)
-
-		authCodeChan <- code
+		log.Println("✅ Callback received")
+		fmt.Fprintf(w, "✅ Authorization successful! You can close this window.")
+		codeChan <- code
 	})
 
-	log.Println("🌐 Callback server listening on http://localhost:9999/callback")
-	http.ListenAndServe(":9999", nil)
+	log.Println("🌐 Callback server started at http://localhost:9999")
+	if err := http.ListenAndServe(":9999", nil); err != nil {
+		log.Printf("❌ Callback server error: %v", err)
+	}
 }
 
-// exchangeToken exchanges the authorization code for access and refresh tokens
-func exchangeToken(code, codeVerifier string) (accessToken, refreshToken string) {
+// exchangeToken exchanges the authorization code for an access and refresh token.
+func exchangeToken(code, verifier string) (accessToken, refreshToken string) {
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
-	data.Set("redirect_uri", redirectURI)
-	data.Set("client_id", clientID)
-	data.Set("code_verifier", codeVerifier)
+	data.Set("redirect_uri", "http://localhost:9999/callback")
+	data.Set("client_id", "demo-client")
+	data.Set("code_verifier", verifier)
 
-	resp, err := http.Post(tokenURL, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+	resp, err := http.Post(
+		"http://localhost:8080/oauth/token",
+		"application/x-www-form-urlencoded",
+		strings.NewReader(data.Encode()),
+	)
 	if err != nil {
-		log.Fatalf("❌ Token exchange failed: %v", err)
+		log.Printf("❌ Token request failed: %v", err)
+		return "", ""
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("❌ Token endpoint error: %s", string(body))
+		log.Printf("❌ Token endpoint error (%d): %s", resp.StatusCode, string(body))
+		return "", ""
 	}
 
 	var tokenResp struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
 	}
 
-	json.Unmarshal(body, &tokenResp)
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		log.Printf("❌ Failed to parse token response: %v", err)
+		return "", ""
+	}
+
+	if tokenResp.Error != "" {
+		log.Printf("❌ Token error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+		return "", ""
+	}
 
 	return tokenResp.AccessToken, tokenResp.RefreshToken
 }
 
-// testToolAccess simulates MCP tool access (simplified for demo)
-func testToolAccess(accessToken string) {
-	log.Println("  ℹ️  Note: Full MCP tool calls require SSE transport")
-	log.Println("  ℹ️  This demo only shows that the token was obtained successfully")
-	log.Printf("  ℹ️  Use this token in MCP Client: Authorization: Bearer %s...", accessToken[:20])
+// refreshToken_ refreshes the access token using a refresh token.
+func refreshToken_(refreshToken string) (accessToken, newRefreshToken string) {
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", refreshToken)
+	data.Set("client_id", "demo-client")
+
+	resp, err := http.Post(
+		"http://localhost:8080/oauth/token",
+		"application/x-www-form-urlencoded",
+		strings.NewReader(data.Encode()),
+	)
+	if err != nil {
+		log.Printf("❌ Token refresh failed: %v", err)
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	json.Unmarshal(body, &tokenResp)
+
+	return tokenResp.AccessToken, tokenResp.RefreshToken
 }

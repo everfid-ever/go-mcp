@@ -24,6 +24,7 @@ func validateRedirectURI(allowedURIs []string, requestedURI string) error {
 
 // validateEndpointSecurity ensures HTTPS is used (except for localhost)
 // OAuth 2.1 requirement: All endpoints must use HTTPS except localhost for development
+// MCP spec: "Redirect URIs MUST be either localhost URLs or HTTPS URLs"
 func validateEndpointSecurity(uri string) error {
 	if uri == "" {
 		return fmt.Errorf("URI cannot be empty")
@@ -34,12 +35,22 @@ func validateEndpointSecurity(uri string) error {
 		return fmt.Errorf("invalid URI: %w", err)
 	}
 
-	// OAuth 2.1 requires HTTPS except for localhost
-	if parsedURL.Scheme != "https" {
-		if !isLocalhost(parsedURL.Host) {
-			return fmt.Errorf("%s: HTTPS required for non-localhost endpoints", ErrInvalidRequest)
-		}
+	// MCP spec: HTTPS or localhost required
+	if parsedURL.Scheme == "https" {
+		// HTTPS always allowed
+		return nil
 	}
+
+	if parsedURL.Scheme == "http" {
+		// HTTP only allowed for localhost
+		if isLocalhost(parsedURL.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("%s: HTTPS required for non-localhost endpoints (MCP spec requirement)", ErrInvalidRequest)
+	}
+
+	// Other schemes (e.g., custom schemes for native apps) may be allowed
+	// but HTTPS/localhost validation is MCP requirement for web endpoints
 
 	// Fragment components are not allowed in redirect URIs
 	if parsedURL.Fragment != "" {
@@ -49,18 +60,32 @@ func validateEndpointSecurity(uri string) error {
 	return nil
 }
 
-// isLocalhost checks if a host is localhost or 127.0.0.1
+// isLocalhost checks if a host is localhost or 127.0.0.1 or ::1 (IPv6)
+// Updated to properly handle IPv6 localhost per MCP spec
 func isLocalhost(host string) bool {
-	// Remove port if present
-	hostWithoutPort := host
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		hostWithoutPort = host[:idx]
+	if host == "" {
+		return false
 	}
 
-	return hostWithoutPort == "localhost" ||
-		hostWithoutPort == "127.0.0.1" ||
-		hostWithoutPort == "[::1]" ||
-		hostWithoutPort == "::1"
+	// Normalize host by removing brackets for IPv6
+	normalizedHost := strings.Trim(host, "[]")
+
+	// Check common localhost representations
+	switch normalizedHost {
+	case "localhost",
+		"127.0.0.1",       // IPv4 loopback
+		"::1",             // IPv6 loopback (short form)
+		"0:0:0:0:0:0:0:1": // IPv6 loopback (long form)
+		return true
+	}
+
+	// Check IPv6 loopback variations
+	if strings.HasPrefix(normalizedHost, "::ffff:127.") {
+		// IPv4-mapped IPv6 addresses (::ffff:127.0.0.1)
+		return true
+	}
+
+	return false
 }
 
 // validateState ensures state parameter is present (CSRF protection)
@@ -114,6 +139,7 @@ func validateClientRedirectURIs(redirectURIs []string, applicationType string) e
 }
 
 // validateRedirectURIFormat validates the format of a redirect URI based on application type
+// Updated to fully comply with MCP spec: "Redirect URIs MUST be either localhost URLs or HTTPS URLs"
 func validateRedirectURIFormat(uri string, applicationType string) error {
 	parsedURL, err := url.Parse(uri)
 	if err != nil {
@@ -125,25 +151,30 @@ func validateRedirectURIFormat(uri string, applicationType string) error {
 		return fmt.Errorf("%s: redirect URIs must not contain fragment components", ErrInvalidRequest)
 	}
 
-	switch applicationType {
-	case "web":
-		// Web clients must use HTTPS (except localhost for development)
-		if parsedURL.Scheme != "https" && !isLocalhost(parsedURL.Host) {
-			return fmt.Errorf("%s: web clients must use HTTPS redirect URIs (except localhost)", ErrInvalidRequest)
-		}
-	case "native":
-		// Native clients can use custom schemes or localhost HTTP
-		if parsedURL.Scheme == "http" {
-			if !isLocalhost(parsedURL.Host) {
-				return fmt.Errorf("%s: native clients cannot use http:// URIs except localhost", ErrInvalidRequest)
-			}
-		}
-		// Custom schemes are allowed for native apps
-	default:
-		return fmt.Errorf("%s: unsupported application type: %s", ErrInvalidRequest, applicationType)
-	}
+	// MCP spec: "Redirect URIs MUST be either localhost URLs or HTTPS URLs"
+	switch parsedURL.Scheme {
+	case "https":
+		// HTTPS always allowed per MCP spec
+		return nil
 
-	return nil
+	case "http":
+		// HTTP only allowed for localhost per MCP spec
+		hostname := parsedURL.Hostname()
+		if !isLocalhost(hostname) {
+			return fmt.Errorf("%s: HTTP redirect URIs only allowed for localhost (MCP spec requirement)", ErrInvalidRequest)
+		}
+		return nil
+
+	default:
+		// For native apps, custom schemes may be allowed
+		if applicationType == "native" {
+			// Custom schemes like myapp:// are allowed for native apps
+			// but MCP spec primarily targets web/server scenarios
+			return nil
+		}
+
+		return fmt.Errorf("%s: redirect URI must use HTTPS or localhost HTTP (MCP spec requirement)", ErrInvalidRequest)
+	}
 }
 
 // parseScopes parses a space-separated scope string into a slice

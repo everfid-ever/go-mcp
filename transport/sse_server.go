@@ -65,6 +65,8 @@ type sseServerTransport struct {
 
 	httpSvr *http.Server
 
+	mux *http.ServeMux
+
 	messageEndpointURL string // Auto-generated
 
 	inFlySend sync.WaitGroup
@@ -135,6 +137,7 @@ func NewSSEServerTransport(addr string, opts ...SSEServerTransportOption) (Serve
 	mux := http.NewServeMux()
 	mux.HandleFunc(t.ssePath, t.handleSSE)
 	mux.HandleFunc(t.messagePath, t.handleMessage)
+	t.mux = mux
 
 	t.httpSvr = &http.Server{
 		Addr:        addr,
@@ -209,6 +212,21 @@ func (t *sseServerTransport) SetReceiver(receiver serverReceiver) {
 
 func (t *sseServerTransport) SetSessionManager(manager sessionManager) {
 	t.sessionManager = manager
+}
+
+// RegisterHandler allows registering custom routes on the HTTP server of the SSE Server
+// Only valid when creating a transport using NewSSEServerTransport
+func (t *sseServerTransport) RegisterHandler(pattern string, handler http.Handler) error {
+	if t.mux == nil {
+		return fmt.Errorf("mux is not available, use NewSSEServerTransport to create transport")
+	}
+	t.mux.Handle(pattern, handler)
+	return nil
+}
+
+// RegisterHandlerFunc is a convenience method of RegisterHandler that accepts HandlerFunc
+func (t *sseServerTransport) RegisterHandlerFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) error {
+	return t.RegisterHandler(pattern, http.HandlerFunc(handler))
 }
 
 func (t *sseServerTransport) handleSSE(w http.ResponseWriter, r *http.Request) {

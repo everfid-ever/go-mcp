@@ -22,44 +22,72 @@ type Server struct {
 type ServerConfig struct {
 	// Issuer identifier
 	Issuer string
-	// Base URL for the server (for metadata generation)
-	BaseURL string
+
+	// MCP Server URL (NEW - required by MCP spec)
+	// The authorization base URL will be automatically derived from this
+	// by discarding the path component
+	MCPServerURL string
+
 	// Supported grant types
 	SupportedGrantTypes []GrantType
+
 	// Authorization code TTL (short-lived, OAuth 2.1 recommends < 10 minutes)
 	AuthorizationCodeTTL time.Duration
+
 	// Require PKCE for all clients
 	RequirePKCE bool
+
 	// Require S256 challenge method
 	RequireS256 bool
+
 	// Enable refresh token rotation
 	RefreshTokenRotation bool
+
 	// Maximum number of redirect URIs per client
 	MaxRedirectURIs int
+
 	// RFC 8707: Resource indicators configuration
 	SupportedResources []string
+
+	// Logger for server operations
+	Logger Logger
+
+	// BaseURL is the derived authorization base URL
+	// This is computed from MCPServerURL by discarding the path component
+	baseURL string
 }
 
+// Logger interface
+type Logger interface {
+	Warnf(format string, args ...interface{})
+	Infof(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
+}
+
+// DefaultLogger is a no-op logger
+type DefaultLogger struct{}
+
+func (d DefaultLogger) Warnf(format string, args ...interface{})  {}
+func (d DefaultLogger) Infof(format string, args ...interface{})  {}
+func (d DefaultLogger) Errorf(format string, args ...interface{}) {}
+
 // DefaultServerConfig returns default OAuth 2.1 configuration
-func DefaultServerConfig(issuer, baseURL string) *ServerConfig {
+func DefaultServerConfig(issuer, mcpServerURL string) *ServerConfig {
 	return &ServerConfig{
-		Issuer:  issuer,
-		BaseURL: baseURL,
+		Issuer:       issuer,
+		MCPServerURL: mcpServerURL,
 		SupportedGrantTypes: []GrantType{
 			GrantTypeAuthorizationCode,
 			GrantTypeClientCredentials,
 			GrantTypeRefreshToken,
 		},
 		AuthorizationCodeTTL: 5 * time.Minute,
-		RequirePKCE:          true,
-		RequireS256:          true,
-		RefreshTokenRotation: true,
+		RequirePKCE:          true, // OAuth 2.1 requirement
+		RequireS256:          true, // OAuth 2.1 best practice
+		RefreshTokenRotation: true, // OAuth 2.1 best practice
 		MaxRedirectURIs:      10,
-		SupportedResources: []string{
-			"mcp://tools",
-			"mcp://prompts",
-			"mcp://resources",
-		},
+		SupportedResources:   DefaultMCPResources, // MCP resources
+		Logger:               DefaultLogger{},
 	}
 }
 
@@ -74,7 +102,22 @@ func NewServer(store Store, signingKey []byte, config *ServerConfig) (*Server, e
 	}
 
 	if config == nil {
-		config = DefaultServerConfig("go-mcp-auth", "http://localhost:8080")
+		return nil, errors.New("config cannot be nil")
+	}
+
+	// Validate MCP Server URL (required for base URL derivation)
+	if config.MCPServerURL == "" {
+		return nil, errors.New("MCPServerURL is required for MCP compliance")
+	}
+
+	// Validate MCP Server URL can be parsed
+	if _, err := url.Parse(config.MCPServerURL); err != nil {
+		return nil, fmt.Errorf("invalid MCPServerURL: %w", err)
+	}
+
+	// Set default logger if not provided
+	if config.Logger == nil {
+		config.Logger = DefaultLogger{}
 	}
 
 	tokenGenerator := NewTokenGenerator(signingKey, config.Issuer)
@@ -83,8 +126,18 @@ func NewServer(store Store, signingKey []byte, config *ServerConfig) (*Server, e
 	pkceValidator.RequirePKCE = config.RequirePKCE
 	pkceValidator.RequireS256 = config.RequireS256
 
-	metadataProvider := NewMetadataProvider(config, config.BaseURL)
+	// Create metadata provider - it will automatically derive authorization base URL
+	metadataProvider, err := NewMetadataProvider(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metadata provider: %w", err)
+	}
+
+	config.baseURL = metadataProvider.GetAuthorizationBaseURL()
+
 	jwksProvider := NewJWKSProvider(signingKey, tokenGenerator.KeyID)
+
+	config.Logger.Infof("OAuth server initialized with authorization base URL: %s (derived from MCP server URL: %s)",
+		metadataProvider.GetAuthorizationBaseURL(), config.MCPServerURL)
 
 	return &Server{
 		store:            store,
@@ -104,6 +157,17 @@ func (s *Server) GetMetadataProvider() *MetadataProvider {
 // GetJWKSProvider returns the JWKS provider
 func (s *Server) GetJWKSProvider() *JWKSProvider {
 	return s.jwksProvider
+}
+
+// GetAuthorizationBaseURL returns the automatically derived authorization base URL
+// This is derived from MCPServerURL per MCP spec requirements
+func (s *Server) GetAuthorizationBaseURL() string {
+	return s.metadataProvider.GetAuthorizationBaseURL()
+}
+
+// GetBaseURL returns the base URL from server config
+func (c *ServerConfig) GetBaseURL() string {
+	return c.baseURL
 }
 
 // HandleAuthorizationRequest handles OAuth 2.1 authorization requests

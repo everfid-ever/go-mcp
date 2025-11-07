@@ -28,11 +28,18 @@ func (h *Handler) SetDynamicRegistrationConfig(config *DynamicRegistrationConfig
 	h.dynamicRegistrationHandler = NewDynamicRegistrationHandler(h.server, config)
 }
 
-// HandleAuthorization handles GET /auth/authorize
+// HandleAuthorization handles GET /oauth/authorize
 func (h *Handler) HandleAuthorization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		h.writeError(w, http.StatusMethodNotAllowed, ErrInvalidRequest, "method not allowed")
 		return
+	}
+
+	// MCP spec: Check MCP-Protocol-Version header (optional but recommended)
+	mcpVersion := r.Header.Get(MCPProtocolVersionHeader)
+	if mcpVersion != "" && mcpVersion != CurrentMCPVersion {
+		h.server.config.Logger.Warnf("Client using MCP version %s, server supports %s", mcpVersion, CurrentMCPVersion)
+		// Continue - version mismatch is a warning, not an error
 	}
 
 	// Parse authorization request
@@ -44,7 +51,7 @@ func (h *Handler) HandleAuthorization(w http.ResponseWriter, r *http.Request) {
 		State:               r.URL.Query().Get("state"),
 		CodeChallenge:       r.URL.Query().Get("code_challenge"),
 		CodeChallengeMethod: r.URL.Query().Get("code_challenge_method"),
-		Resource:            r.URL.Query()["resource"], // RFC 8707: Can be repeated
+		Resource:            r.URL.Query()["resource"], // RFC 8707
 	}
 
 	// State parameter is required for CSRF protection
@@ -72,7 +79,7 @@ func (h *Handler) HandleAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce HTTPS for redirect URIs
+	// MCP spec: Enforce HTTPS or localhost for redirect URIs
 	if err := validateEndpointSecurity(req.RedirectURI); err != nil {
 		h.redirectWithError(w, r, req.RedirectURI, req.State, err)
 		return
@@ -127,11 +134,17 @@ func (h *Handler) HandleAuthorization(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
-// HandleToken handles POST /auth/token
+// HandleToken handles POST /oauth/token
 func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, ErrInvalidRequest, "method not allowed")
 		return
+	}
+
+	// MCP spec: Check MCP-Protocol-Version header
+	mcpVersion := r.Header.Get(MCPProtocolVersionHeader)
+	if mcpVersion != "" && mcpVersion != CurrentMCPVersion {
+		h.server.config.Logger.Warnf("Client using MCP version %s for token request", mcpVersion)
 	}
 
 	// Parse form data
@@ -149,7 +162,7 @@ func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 		ClientSecret: r.FormValue("client_secret"),
 		RefreshToken: r.FormValue("refresh_token"),
 		Scope:        r.FormValue("scope"),
-		Resource:     r.Form["resource"], // RFC 8707: Can be repeated
+		Resource:     r.Form["resource"], // RFC 8707
 		CodeVerifier: r.FormValue("code_verifier"),
 	}
 
@@ -173,7 +186,7 @@ func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, tokenResp)
 }
 
-// HandleIntrospection handles POST /auth/introspect
+// HandleIntrospection handles POST /oauth/introspect
 func (h *Handler) HandleIntrospection(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, ErrInvalidRequest, "method not allowed")
@@ -215,7 +228,7 @@ func (h *Handler) HandleIntrospection(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, resp)
 }
 
-// HandleRevocation handles POST /auth/revoke
+// HandleRevocation handles POST /oauth/revoke
 func (h *Handler) HandleRevocation(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, ErrInvalidRequest, "method not allowed")
@@ -259,7 +272,6 @@ func (h *Handler) HandleRevocation(w http.ResponseWriter, r *http.Request) {
 	if tokenTypeHint == "refresh_token" {
 		_ = h.server.store.RevokeRefreshToken(ctx, token)
 	} else {
-		// Try both access and refresh token
 		_ = h.server.store.RevokeAccessToken(ctx, token)
 		_ = h.server.store.RevokeRefreshToken(ctx, token)
 	}
@@ -400,7 +412,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// RFC 8414: Authorization Server Metadata
 	mux.Handle("/.well-known/oauth-authorization-server", h.server.GetMetadataProvider())
 
-	// RFC 9728: Protected Resource Metadata (新增)
+	// RFC 9728: Protected Resource Metadata (optional)
 	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 
 	// JWKS endpoint
@@ -425,7 +437,7 @@ func (h *Handler) RegisterRoutesWithPrefix(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc("/register", h.dynamicRegistrationHandler.HandleRegister)
 	mux.HandleFunc("/register/", h.dynamicRegistrationHandler.HandleClientConfiguration)
 
-	// Metadata and JWKS at well-known locations (not prefixed)
+	// Metadata and JWKS at well-known locations (not prefixed per spec)
 	mux.Handle("/.well-known/oauth-authorization-server", h.server.GetMetadataProvider())
 	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 	mux.Handle("/.well-known/jwks.json", h.server.GetJWKSProvider())
@@ -451,8 +463,13 @@ func (h *Handler) RegisterRoutesWithOAuth(mux *http.ServeMux) {
 	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 	mux.Handle("/.well-known/jwks.json", h.server.GetJWKSProvider())
 
+	// Third-party OAuth flow endpoints
 	if h.oauthClient != nil {
 		mux.HandleFunc("/oauth/login", h.oauthClient.InitiateOAuthFlow)
 		mux.HandleFunc("/oauth/callback", h.oauthClient.HandleCallback)
 	}
+}
+
+func (h *Handler) GetDynamicRegistrationHandler() *DynamicRegistrationHandler {
+	return h.dynamicRegistrationHandler
 }

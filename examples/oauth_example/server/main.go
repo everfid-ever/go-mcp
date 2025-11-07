@@ -15,202 +15,131 @@ import (
 )
 
 func main() {
-	// 1. Create an in-memory storage backend
+	// 1. Create the OAuth server
 	store := memory.NewStore()
+	signingKey := []byte("my-secret-key-must-be-32-bytes!!")
 
-	// 2. JWT signing secret (must be at least 32 bytes)
-	jwtSecret := []byte("example-secret-key-must-be-at-least-32-bytes-long!!")
+	authServer, _ := auth.NewServer(
+		store,
+		signingKey,
+		auth.DefaultServerConfig(
+			"http://localhost:8080",
+			"http://localhost:8080/mcp",
+		),
+	)
 
-	// 3. Create the OAuth Server (with PKCE enabled)
-	serverConfig := auth.DefaultServerConfig("mcp-example-server")
-	serverConfig.RequirePKCE = true
-	serverConfig.RequireS256 = true
-
-	authServer, err := auth.NewServer(store, jwtSecret, serverConfig)
-	if err != nil {
-		log.Fatalf("Failed to create auth server: %v", err)
-	}
-
-	// 4. Pre-register an MCP Client (simulating Claude Desktop)
-	client := &auth.Client{
-		ID:           "mcp-client-demo",
-		Name:         "MCP Client Demo",
+	// 2. Register a demo client
+	store.CreateClient(context.Background(), &auth.Client{
+		ID:           "demo-client",
+		Name:         "Demo Client",
 		RedirectURIs: []string{"http://localhost:9999/callback"},
 		GrantTypes:   []string{"authorization_code", "refresh_token"},
-		Scopes:       []string{"read", "write", "admin"},
-		IsPublic:     true, // Public client (desktop app, CLI, etc.)
+		Scopes:       []string{"read", "write"},
+		IsPublic:     true,
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
-	if err := store.CreateClient(context.Background(), client); err != nil {
-		log.Fatalf("Failed to create client: %v", err)
-	}
+	// 3. Create SSE transport using NewSSEServerTransportAndHandler
+	sseTransport, sseHandler, _ := transport.NewSSEServerTransportAndHandler(
+		"http://localhost:8080/mcp/message",
+	)
 
-	log.Printf("✅ Registered client: %s", client.ID)
-
-	// 5. Create an HTTP handler for OAuth endpoints
-	handler := auth.NewHandler(authServer)
-
-	// 6. Register OAuth endpoints
-	mux := http.NewServeMux()
-
-	// Standard OAuth endpoints
-	mux.HandleFunc("/.well-known/oauth-authorization-server", handleMetadata)
-	mux.HandleFunc("/oauth/authorize", handleAuthorizeSimple(authServer))
-	mux.HandleFunc("/oauth/token", handler.HandleToken)
-	mux.HandleFunc("/oauth/introspect", handler.HandleIntrospection)
-	mux.HandleFunc("/oauth/revoke", handler.HandleRevocation)
-
-	// Start the OAuth HTTP server
-	go func() {
-		log.Println("🔐 OAuth Server started")
-		log.Println("   Discovery: http://localhost:8080/.well-known/oauth-authorization-server")
-		log.Println("   Authorize: http://localhost:8080/oauth/authorize")
-		log.Println("   Token:     http://localhost:8080/oauth/token")
-		if err := http.ListenAndServe(":8080", mux); err != nil {
-			log.Fatalf("OAuth server error: %v", err)
-		}
-	}()
-
-	// 7. Create the MCP Server
-	t, _ := transport.NewSSEServerTransport("127.0.0.1:9090")
-
-	mcpServer, _ := server.NewServer(t,
-		server.WithServerInfo(protocol.Implementation{
-			Name:    "simple-oauth-example",
-			Version: "1.0.0",
-		}),
+	// 4. Create the MCP server (integrated with OAuth)
+	mcpServer, _ := server.NewServer(sseTransport,
 		server.WithAuth(authServer, map[string][]string{
-			"read_data":   {"read"},
-			"write_data":  {"write"},
-			"delete_data": {"admin"},
+			"echo": {"read"},
 		}),
 	)
 
-	// 8. Register MCP tools
-	registerTools(mcpServer)
+	// 5. Register a simple test tool
+	echoTool, _ := protocol.NewTool("echo", "Echo back your message", struct {
+		Message string `json:"message" jsonschema:"required,description=Your message"`
+	}{})
 
-	log.Println("🚀 MCP Server started on http://localhost:9090/sse")
-	log.Println("\n👉 Run the client: go run client.go\n")
-	mcpServer.Run()
-}
+	mcpServer.RegisterTool(echoTool, func(ctx context.Context, req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
+		msg := req.Arguments["message"].(string)
+		userID := auth.GetUserID(ctx)
 
-// handleMetadata returns OAuth 2.1 authorization server metadata
-func handleMetadata(w http.ResponseWriter, r *http.Request) {
-	metadata := map[string]interface{}{
-		"issuer":                                        "mcp-example-server",
-		"authorization_endpoint":                        "http://localhost:8080/oauth/authorize",
-		"token_endpoint":                                "http://localhost:8080/oauth/token",
-		"revocation_endpoint":                           "http://localhost:8080/oauth/revoke",
-		"introspection_endpoint":                        "http://localhost:8080/oauth/introspect",
-		"response_types_supported":                      []string{"code"},
-		"grant_types_supported":                         []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":              []string{"S256"},
-		"token_endpoint_auth_methods_supported":         []string{"none"}, // Public clients only
-		"revocation_endpoint_auth_methods_supported":    []string{"none"},
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic"},
-	}
+		return &protocol.CallToolResult{
+			Content: []protocol.Content{
+				&protocol.TextContent{
+					Type: "text",
+					Text: fmt.Sprintf("Echo: %s (user: %s)", msg, userID),
+				},
+			},
+		}, nil
+	})
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `%v`, toJSON(metadata))
-}
+	// 6. Manually create HTTP routes (including auto-approval for OAuth authorization)
+	mux := http.NewServeMux()
 
-// handleAuthorizeSimple provides a simplified authorization endpoint (auto-approved)
-func handleAuthorizeSimple(authServer *auth.Server) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Parse authorization request
-		req := &auth.AuthorizationRequest{
-			ResponseType:        r.URL.Query().Get("response_type"),
-			ClientID:            r.URL.Query().Get("client_id"),
-			RedirectURI:         r.URL.Query().Get("redirect_uri"),
-			Scope:               r.URL.Query().Get("scope"),
-			State:               r.URL.Query().Get("state"),
-			CodeChallenge:       r.URL.Query().Get("code_challenge"),
-			CodeChallengeMethod: r.URL.Query().Get("code_challenge_method"),
-		}
+	// ✅ MCP SSE endpoints
+	mux.Handle("/mcp", sseHandler.HandleSSE())
+	mux.Handle("/mcp/message", sseHandler.HandleMessage())
 
-		log.Printf("📝 Authorization request: client=%s, scope=%s", req.ClientID, req.Scope)
+	// ✅ OAuth endpoints (custom authorization handler - auto-approve mode)
+	oauthHandler := mcpServer.GetOAuthHandler()
 
-		// ✅ Key point: Automatically approve the request, using client_id as userID
-		// In a real implementation, you could:
-		// 1. Extract user_id from the request parameters
-		// 2. Retrieve it from an external authentication system
-		// 3. Use an anonymous or demo user
-		userID := req.ClientID + "-user" // Example: bind a virtual user to each client
+	// Register the auto-approval authorization endpoint
+	mux.HandleFunc("/oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
+		handleAutoApproveAuthorize(w, r, authServer)
+	})
 
-		// Generate authorization code and redirect
-		redirectURL, err := authServer.HandleAuthorizationRequest(r.Context(), req, userID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+	// Other standard OAuth endpoints
+	mux.HandleFunc("/oauth/token", oauthHandler.HandleToken)
+	mux.HandleFunc("/oauth/introspect", oauthHandler.HandleIntrospection)
+	mux.HandleFunc("/oauth/revoke", oauthHandler.HandleRevocation)
 
-		log.Printf("✅ Authorization granted for user: %s", userID)
-		http.Redirect(w, r, redirectURL, http.StatusFound)
+	// Metadata endpoints
+	mux.Handle("/.well-known/oauth-authorization-server", authServer.GetMetadataProvider())
+	mux.Handle("/.well-known/jwks.json", authServer.GetJWKSProvider())
+
+	// 7. Start the HTTP server and MCP server
+	go mcpServer.Run()
+
+	log.Println("🚀 Server started at http://localhost:8080")
+	log.Println("   MCP SSE:   http://localhost:8080/mcp")
+	log.Println("   OAuth:     http://localhost:8080/oauth/authorize")
+	log.Println("")
+	log.Println("👉 Run client: go run client/main.go")
+
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Fatalf("Server failed: %v", err)
 	}
 }
 
-// registerTools registers sample MCP tools with different scope requirements
-func registerTools(s *server.Server) {
-	// Tool 1: Read data (requires "read" scope)
-	readTool, _ := protocol.NewTool("read_data", "Read data from server", struct {
-		Key string `json:"key" description:"Data key to read"`
-	}{})
+// ✅ Auto-approve authorization requests (for demo/testing purposes)
+func handleAutoApproveAuthorize(w http.ResponseWriter, r *http.Request, authServer *auth.Server) {
+	// Parse authorization request
+	req := &auth.AuthorizationRequest{
+		ResponseType:        r.URL.Query().Get("response_type"),
+		ClientID:            r.URL.Query().Get("client_id"),
+		RedirectURI:         r.URL.Query().Get("redirect_uri"),
+		Scope:               r.URL.Query().Get("scope"),
+		State:               r.URL.Query().Get("state"),
+		CodeChallenge:       r.URL.Query().Get("code_challenge"),
+		CodeChallengeMethod: r.URL.Query().Get("code_challenge_method"),
+		Resource:            r.URL.Query()["resource"],
+	}
 
-	s.RegisterTool(readTool, func(ctx context.Context, req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-		userID := auth.GetUserID(ctx)
-		scopes := auth.GetScopes(ctx)
+	log.Printf("📝 Authorization request: client=%s, scope=%s", req.ClientID, req.Scope)
 
-		return &protocol.CallToolResult{
-			Content: []protocol.Content{
-				&protocol.TextContent{
-					Text: fmt.Sprintf("✅ Read data (user: %s, scopes: %v)", userID, scopes),
-				},
-			},
-		}, nil
-	})
+	// ✅ Auto-approve: use client ID as the user ID
+	// In production, you should:
+	// 1. Authenticate the user (check session/cookie)
+	// 2. Show a consent screen to ask for user approval
+	// 3. Generate an authorization code only after user consent
+	userID := req.ClientID + "-user"
 
-	// Tool 2: Write data (requires "write" scope)
-	writeTool, _ := protocol.NewTool("write_data", "Write data to server", struct {
-		Key   string `json:"key" description:"Data key"`
-		Value string `json:"value" description:"Data value"`
-	}{})
+	// Generate authorization code and redirect
+	redirectURL, err := authServer.HandleAuthorizationRequest(r.Context(), req, userID)
+	if err != nil {
+		log.Printf("❌ Authorization failed: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	s.RegisterTool(writeTool, func(ctx context.Context, req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-		userID := auth.GetUserID(ctx)
-		scopes := auth.GetScopes(ctx)
-
-		return &protocol.CallToolResult{
-			Content: []protocol.Content{
-				&protocol.TextContent{
-					Text: fmt.Sprintf("✅ Write data (user: %s, scopes: %v)", userID, scopes),
-				},
-			},
-		}, nil
-	})
-
-	// Tool 3: Delete data (requires "admin" scope)
-	deleteTool, _ := protocol.NewTool("delete_data", "Delete data from server", struct {
-		Key string `json:"key" description:"Data key to delete"`
-	}{})
-
-	s.RegisterTool(deleteTool, func(ctx context.Context, req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-		userID := auth.GetUserID(ctx)
-		scopes := auth.GetScopes(ctx)
-
-		return &protocol.CallToolResult{
-			Content: []protocol.Content{
-				&protocol.TextContent{
-					Text: fmt.Sprintf("✅ Delete data (user: %s, scopes: %v)", userID, scopes),
-				},
-			},
-		}, nil
-	})
-}
-
-// toJSON converts an object to a JSON-like string (simplified for demo)
-func toJSON(v interface{}) string {
-	return fmt.Sprintf("%v", v)
+	log.Printf("✅ Auto-approved for user: %s", userID)
+	http.Redirect(w, r, redirectURL, http.StatusFound)
 }

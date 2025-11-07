@@ -85,6 +85,9 @@ func WithAuth(authServer *auth.Server, toolScopes map[string][]string) Option {
 		middleware := auth.NewMiddleware(authServer)
 		s.authMiddleware = middleware
 
+		s.authHandler = auth.NewHandler(authServer)
+		s.authServer = authServer
+
 		if len(toolScopes) > 0 {
 			// Call the generic function with the specific type from this package.
 			mw := auth.ScopeBasedToolMiddleware[ToolHandlerFunc](middleware, toolScopes)
@@ -128,9 +131,9 @@ type Server struct {
 
 	toolFilters ToolFilter
 
-	authMiddleware *auth.Middleware // HTTP 层认证中间件
-	authServer     *auth.Server     // OAuth server（用于注册路由）
-	oauthPrefix    string           // OAuth 路由前缀
+	authMiddleware *auth.Middleware
+	authServer     *auth.Server
+	authHandler    *auth.Handler
 }
 
 func NewServer(t transport.ServerTransport, opts ...Option) (*Server, error) {
@@ -350,4 +353,45 @@ func (s *Server) WrapWithAuth(handler http.Handler) http.Handler {
 		return handler
 	}
 	return s.authMiddleware.HTTPMiddleware(handler)
+}
+
+func (server *Server) GetOAuthHandler() *auth.Handler {
+	return server.authHandler
+}
+
+// RegisterOAuthRoutes automatically registers OAuth routes with transport
+// Only effective if transport implements the HTTPRouteRegistrar interface
+func (server *Server) RegisterOAuthRoutes() error {
+	if server.authHandler == nil {
+		return fmt.Errorf("OAuth not configured, use WithAuth option")
+	}
+
+	// 尝试获取 HTTPRouteRegistrar 接口
+	registrar, ok := server.transport.(interface {
+		RegisterHandler(pattern string, handler http.Handler) error
+	})
+
+	if !ok {
+		return fmt.Errorf("transport does not support HTTP route registration")
+	}
+
+	// 注册 OAuth 路由
+	routes := map[string]http.Handler{
+		"/oauth/authorize":  http.HandlerFunc(server.authHandler.HandleAuthorization),
+		"/oauth/token":      http.HandlerFunc(server.authHandler.HandleToken),
+		"/oauth/introspect": http.HandlerFunc(server.authHandler.HandleIntrospection),
+		"/oauth/revoke":     http.HandlerFunc(server.authHandler.HandleRevocation),
+		"/register":         http.HandlerFunc(server.authHandler.GetDynamicRegistrationHandler().HandleRegister),
+		"/.well-known/oauth-authorization-server": server.authServer.GetMetadataProvider(),
+		"/.well-known/oauth-protected-resource":   http.HandlerFunc(server.authServer.GetMetadataProvider().ServeProtectedResourceMetadata),
+		"/.well-known/jwks.json":                  server.authServer.GetJWKSProvider(),
+	}
+
+	for pattern, handler := range routes {
+		if err := registrar.RegisterHandler(pattern, handler); err != nil {
+			return fmt.Errorf("failed to register %s: %w", pattern, err)
+		}
+	}
+
+	return nil
 }

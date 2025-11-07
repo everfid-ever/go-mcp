@@ -412,7 +412,7 @@ func (h *DynamicRegistrationHandler) registerClient(ctx context.Context, req *Cl
 			return nil, fmt.Errorf("%s: %w", ErrServerError, err)
 		}
 
-		registrationClientURI = h.server.config.BaseURL + "/register/" + clientID
+		registrationClientURI = h.server.config.GetBaseURL() + "/register/" + clientID
 	}
 
 	// Build response

@@ -2,7 +2,9 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
 )
 
 // AuthorizationServerMetadata represents OAuth 2.0 Authorization Server Metadata (RFC 8414)
@@ -66,6 +68,7 @@ type AuthorizationServerMetadata struct {
 
 // ProtectedResourceMetadata represents OAuth 2.0 Protected Resource Metadata (RFC 9728)
 // This metadata helps MCP clients discover how to access protected resources
+// NOTE: RFC 9728 is NOT required by MCP spec but included for completeness
 type ProtectedResourceMetadata struct {
 	// REQUIRED: The protected resource identifier (URI)
 	Resource string `json:"resource"`
@@ -118,22 +121,54 @@ type MCPResourcesCapability struct {
 // MetadataProvider generates authorization server and protected resource metadata
 type MetadataProvider struct {
 	config                    *ServerConfig
-	baseURL                   string
+	authorizationBaseURL      string // Derived from MCP server URL per spec
 	authServerMetadata        *AuthorizationServerMetadata
 	protectedResourceMetadata *ProtectedResourceMetadata
 	enableProtectedResourceMD bool
+	logger                    Logger
 }
 
 // NewMetadataProvider creates a new metadata provider
-func NewMetadataProvider(config *ServerConfig, baseURL string) *MetadataProvider {
+// Automatically derives authorization base URL from MCP server URL per MCP spec
+func NewMetadataProvider(config *ServerConfig) (*MetadataProvider, error) {
 	mp := &MetadataProvider{
 		config:                    config,
-		baseURL:                   baseURL,
 		enableProtectedResourceMD: true, // Enable by default for MCP compliance
+		logger:                    config.Logger,
 	}
+
+	// Derive authorization base URL from MCP server URL
+	// MCP spec: "The authorization base URL MUST be determined from the MCP server URL
+	// by discarding any existing path component"
+	baseURL, err := deriveAuthorizationBaseURL(config.MCPServerURL)
+	if err != nil {
+		return nil, err
+	}
+	mp.authorizationBaseURL = baseURL
+
 	mp.generateAuthServerMetadata()
 	mp.generateProtectedResourceMetadata()
-	return mp
+	return mp, nil
+}
+
+// deriveAuthorizationBaseURL implements MCP spec requirement:
+// "discarding any existing path component"
+func deriveAuthorizationBaseURL(mcpServerURL string) (string, error) {
+	if mcpServerURL == "" {
+		return "", ErrInvalidServerURL
+	}
+
+	parsedURL, err := url.Parse(mcpServerURL)
+	if err != nil {
+		return "", err
+	}
+
+	// Discard path, query, and fragment per MCP spec
+	parsedURL.Path = ""
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+
+	return parsedURL.String(), nil
 }
 
 // SetProtectedResourceMetadataEnabled enables or disables protected resource metadata
@@ -150,12 +185,12 @@ func (mp *MetadataProvider) generateAuthServerMetadata() {
 
 	mp.authServerMetadata = &AuthorizationServerMetadata{
 		Issuer:                mp.config.Issuer,
-		AuthorizationEndpoint: mp.baseURL + "/oauth/authorize",
-		TokenEndpoint:         mp.baseURL + "/oauth/token",
-		RevocationEndpoint:    mp.baseURL + "/oauth/revoke",
-		IntrospectionEndpoint: mp.baseURL + "/oauth/introspect",
-		JWKSURI:               mp.baseURL + "/.well-known/jwks.json",
-		RegistrationEndpoint:  mp.baseURL + "/register",
+		AuthorizationEndpoint: mp.authorizationBaseURL + "/oauth/authorize",
+		TokenEndpoint:         mp.authorizationBaseURL + "/oauth/token",
+		RevocationEndpoint:    mp.authorizationBaseURL + "/oauth/revoke",
+		IntrospectionEndpoint: mp.authorizationBaseURL + "/oauth/introspect",
+		JWKSURI:               mp.authorizationBaseURL + "/.well-known/jwks.json",
+		RegistrationEndpoint:  mp.authorizationBaseURL + "/register",
 
 		ResponseTypesSupported: []string{"code"},
 		ResponseModesSupported: []string{"query"},
@@ -180,7 +215,7 @@ func (mp *MetadataProvider) generateAuthServerMetadata() {
 		ResourceIndicatorsSupported: true,
 
 		// MCP-specific
-		MCPVersion:             "2025-03-26",
+		MCPVersion:             CurrentMCPVersion,
 		MCPTransportsSupported: []string{"sse", "stdio"},
 
 		ScopesSupported: []string{
@@ -210,7 +245,7 @@ func (mp *MetadataProvider) generateProtectedResourceMetadata() {
 			mp.config.Issuer, // This MCP server acts as its own authorization server
 		},
 		BearerMethodsSupported: []string{
-			"header", // Authorization: Bearer <token>
+			"header", // Authorization: Bearer <token> (MCP spec requirement)
 		},
 		ResourceSigningAlgValuesSupported: []string{
 			"RS256", // RSA with SHA-256
@@ -226,7 +261,7 @@ func (mp *MetadataProvider) generateProtectedResourceMetadata() {
 			"resources:list",
 			"resources:read",
 		},
-		ResourceDocumentation: mp.baseURL + "/docs",
+		ResourceDocumentation: mp.authorizationBaseURL + "/docs",
 		MCPCapabilities: &MCPResourceCapabilities{
 			Tools: &MCPToolsCapability{
 				ListChanged: true,
@@ -252,12 +287,30 @@ func (mp *MetadataProvider) GetProtectedResourceMetadata() *ProtectedResourceMet
 	return mp.protectedResourceMetadata
 }
 
+// GetAuthorizationBaseURL returns the derived authorization base URL
+func (mp *MetadataProvider) GetAuthorizationBaseURL() string {
+	return mp.authorizationBaseURL
+}
+
 // ServeHTTP handles the authorization server metadata endpoint
 // Endpoint: /.well-known/oauth-authorization-server
+// MCP spec: "MCP clients MUST follow the OAuth 2.0 Authorization Server Metadata protocol"
 func (mp *MetadataProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// MCP spec: Check MCP-Protocol-Version header
+	mcpVersion := r.Header.Get(MCPProtocolVersionHeader)
+	if mcpVersion != "" {
+		if !mp.isCompatibleMCPVersion(mcpVersion) {
+			mp.logger.Warnf("Client requested MCP version %s, server supports %s", mcpVersion, CurrentMCPVersion)
+			// Continue serving - version mismatch is a warning, not an error
+			// Clients should handle version differences gracefully
+		}
+	} else {
+		mp.logger.Infof("Client did not provide MCP-Protocol-Version header")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -269,6 +322,7 @@ func (mp *MetadataProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeProtectedResourceMetadata handles the protected resource metadata endpoint
 // Endpoint: /.well-known/oauth-protected-resource
+// NOTE: This is RFC 9728, not required by MCP spec but useful for advanced scenarios
 func (mp *MetadataProvider) ServeProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
 	if !mp.enableProtectedResourceMD {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -280,11 +334,24 @@ func (mp *MetadataProvider) ServeProtectedResourceMetadata(w http.ResponseWriter
 		return
 	}
 
+	// Check MCP version
+	mcpVersion := r.Header.Get(MCPProtocolVersionHeader)
+	if mcpVersion != "" && !mp.isCompatibleMCPVersion(mcpVersion) {
+		mp.logger.Warnf("Client requested MCP version %s for protected resource metadata", mcpVersion)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	json.NewEncoder(w).Encode(mp.protectedResourceMetadata)
+}
+
+// isCompatibleMCPVersion checks if the requested MCP version is compatible
+func (mp *MetadataProvider) isCompatibleMCPVersion(requestedVersion string) bool {
+	// For now, exact match required
+	// In production, implement semantic versioning compatibility
+	return requestedVersion == CurrentMCPVersion
 }
 
 // CustomizeProtectedResourceMetadata allows customization of protected resource metadata
@@ -315,3 +382,6 @@ func (mp *MetadataProvider) AddAuthorizationServer(authServerURI string) {
 		authServerURI,
 	)
 }
+
+// Additional error for metadata provider
+var ErrInvalidServerURL = errors.New("auth: invalid MCP server URL")
