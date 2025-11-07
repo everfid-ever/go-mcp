@@ -45,6 +45,13 @@ func WithLogger(logger pkg.Logger) Option {
 	}
 }
 
+func WithAuth(token string, expiry time.Time) Option {
+	return func(c *Client) {
+		c.accessToken = token
+		c.tokenExpiry = expiry
+	}
+}
+
 type Client struct {
 	transport transport.ClientTransport
 
@@ -74,6 +81,10 @@ type Client struct {
 	closed chan struct{}
 
 	logger pkg.Logger
+
+	accessToken string
+	tokenExpiry time.Time
+	tokenMutex  sync.RWMutex
 }
 
 func NewClient(t transport.ClientTransport, opts ...Option) (*Client, error) {
@@ -92,6 +103,13 @@ func NewClient(t transport.ClientTransport, opts ...Option) (*Client, error) {
 
 	for _, opt := range opts {
 		opt(client)
+	}
+
+	if tp, ok := t.(interface{ SetTokenProvider(func() string) }); ok {
+		tp.SetTokenProvider(func() string {
+			token, _ := client.GetAccessToken()
+			return token
+		})
 	}
 
 	if client.notifyHandler == nil {
@@ -159,4 +177,23 @@ func (client *Client) sessionDetection() {
 	if _, err := client.Ping(ctx, protocol.NewPingRequest()); err != nil {
 		client.logger.Warnf("mcp client ping server fail: %v", err)
 	}
+}
+
+func (c *Client) SetAccessToken(token string, expiry time.Time) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+
+	c.accessToken = token
+	c.tokenExpiry = expiry
+}
+
+func (c *Client) GetAccessToken() (string, bool) {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+
+	if time.Now().After(c.tokenExpiry) {
+		return "", false
+	}
+
+	return c.accessToken, true
 }

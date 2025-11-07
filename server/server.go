@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/ThinkInAIXYZ/go-mcp/auth"
 	"github.com/ThinkInAIXYZ/go-mcp/pkg"
 	"github.com/ThinkInAIXYZ/go-mcp/protocol"
 	"github.com/ThinkInAIXYZ/go-mcp/server/session"
@@ -46,8 +48,8 @@ func WithLogger(logger pkg.Logger) Option {
 	}
 }
 
-// ToolMiddleware defines the middleware type of the tool handler
-// Allow ToolHandlerFunc to be wrapped like a chain call
+// ToolHandlerFunc and ToolMiddleware are defined and stay in the server package.
+type ToolHandlerFunc func(context.Context, *protocol.CallToolRequest) (*protocol.CallToolResult, error)
 type ToolMiddleware func(ToolHandlerFunc) ToolHandlerFunc
 
 // RateLimitMiddleware Return a rate-limiting middleware
@@ -71,6 +73,29 @@ func WithPagination(limit int) Option {
 func WithGenSessionIDFunc(genSessionID func(context.Context) string) Option {
 	return func(s *Server) {
 		s.genSessionID = genSessionID
+	}
+}
+
+func WithAuth(authServer *auth.Server, toolScopes map[string][]string) Option {
+	return func(s *Server) {
+		if authServer == nil {
+			return
+		}
+
+		middleware := auth.NewMiddleware(authServer)
+		s.authMiddleware = middleware
+
+		if len(toolScopes) > 0 {
+			// Call the generic function with the specific type from this package.
+			mw := auth.ScopeBasedToolMiddleware[ToolHandlerFunc](middleware, toolScopes)
+			s.Use(mw)
+		} else {
+			// Call the generic function with the specific type from this package.
+			mw := auth.MCPToolMiddleware[ToolHandlerFunc](middleware, &auth.MiddlewareConfig{
+				RequiredScopes: []string{"read"},
+			})
+			s.Use(mw)
+		}
 	}
 }
 
@@ -102,6 +127,10 @@ type Server struct {
 	globalMiddlewares []ToolMiddleware
 
 	toolFilters ToolFilter
+
+	authMiddleware *auth.Middleware // HTTP 层认证中间件
+	authServer     *auth.Server     // OAuth server（用于注册路由）
+	oauthPrefix    string           // OAuth 路由前缀
 }
 
 func NewServer(t transport.ServerTransport, opts ...Option) (*Server, error) {
@@ -124,6 +153,10 @@ func NewServer(t transport.ServerTransport, opts ...Option) (*Server, error) {
 
 	for _, opt := range opts {
 		opt(server)
+	}
+
+	if server.authMiddleware != nil {
+		t.ApplyAuthMiddleware(server.authMiddleware.HTTPMiddleware)
 	}
 
 	server.sessionManager.SetLogger(server.logger)
@@ -154,8 +187,6 @@ type toolEntry struct {
 	tool    *protocol.Tool
 	handler ToolHandlerFunc
 }
-
-type ToolHandlerFunc func(context.Context, *protocol.CallToolRequest) (*protocol.CallToolResult, error)
 
 func (server *Server) RegisterTool(tool *protocol.Tool, toolHandler ToolHandlerFunc, middlewares ...ToolMiddleware) {
 	for i := len(middlewares) - 1; i >= 0; i-- {
@@ -312,4 +343,11 @@ func (server *Server) sessionDetection(ctx context.Context, sessionID string) er
 		return err
 	}
 	return nil
+}
+
+func (s *Server) WrapWithAuth(handler http.Handler) http.Handler {
+	if s.authMiddleware == nil {
+		return handler
+	}
+	return s.authMiddleware.HTTPMiddleware(handler)
 }

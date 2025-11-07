@@ -41,6 +41,12 @@ func WithRetryFunc(retry func(func() error)) SSEClientTransportOption {
 	}
 }
 
+func WithSSEClientTransportAuthToken(tokenProvider func() string) SSEClientTransportOption {
+	return func(t *sseClientTransport) {
+		t.tokenProvider = tokenProvider
+	}
+}
+
 type sseClientTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -59,6 +65,8 @@ type sseClientTransport struct {
 	retry func(func() error)
 
 	sseConnectClose chan struct{}
+
+	tokenProvider func() string
 }
 
 func NewSSEClientTransport(serverURL string, opts ...SSEClientTransportOption) (ClientTransport, error) {
@@ -246,6 +254,12 @@ func (t *sseClientTransport) Send(ctx context.Context, msg Message) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+
+	if t.tokenProvider != nil {
+		if token := t.tokenProvider(); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
 
 	if resp, err = t.client.Do(req); err != nil {
 		return fmt.Errorf("failed to send message: %w", err)

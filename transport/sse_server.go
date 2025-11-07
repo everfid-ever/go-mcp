@@ -73,6 +73,8 @@ type sseServerTransport struct {
 
 	sessionManager sessionManager
 
+	authMiddleware func(http.Handler) http.Handler
+
 	// options
 	logger        pkg.Logger
 	ssePath       string
@@ -98,6 +100,10 @@ func (h *SSEHandler) HandleMessage() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.transport.handleMessage(w, r)
 	})
+}
+
+func (t *sseServerTransport) ApplyAuthMiddleware(middleware func(http.Handler) http.Handler) {
+	t.authMiddleware = middleware
 }
 
 // NewSSEServerTransport returns transport that will start an HTTP server
@@ -269,6 +275,17 @@ func (t *sseServerTransport) handleSSE(w http.ResponseWriter, r *http.Request) {
 // handleMessage processes incoming JSON-RPC messages from clients and sends responses
 // back through both the SSE connection and HTTP response.
 func (t *sseServerTransport) handleMessage(w http.ResponseWriter, r *http.Request) {
+	if t.authMiddleware != nil {
+		t.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.handleMessageCore(w, r)
+		})).ServeHTTP(w, r)
+		return
+	}
+
+	t.handleMessageCore(w, r)
+}
+
+func (t *sseServerTransport) handleMessageCore(w http.ResponseWriter, r *http.Request) {
 	defer pkg.RecoverWithFunc(func(_ any) {
 		t.writeError(w, http.StatusInternalServerError, "Internal server error")
 	})
