@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,15 +11,21 @@ import (
 
 // Handler provides HTTP handlers for OAuth 2.1 endpoints
 type Handler struct {
-	server      *Server
-	oauthClient *OAuthClient
+	server                     *Server
+	oauthClient                *OAuthClient
+	dynamicRegistrationHandler *DynamicRegistrationHandler
 }
 
 // NewHandler creates a new OAuth handler
 func NewHandler(server *Server) *Handler {
 	return &Handler{
-		server: server,
+		server:                     server,
+		dynamicRegistrationHandler: NewDynamicRegistrationHandler(server, nil),
 	}
+}
+
+func (h *Handler) SetDynamicRegistrationConfig(config *DynamicRegistrationConfig) {
+	h.dynamicRegistrationHandler = NewDynamicRegistrationHandler(h.server, config)
 }
 
 // HandleAuthorization handles GET /auth/authorize
@@ -40,21 +47,78 @@ func (h *Handler) HandleAuthorization(w http.ResponseWriter, r *http.Request) {
 		Resource:            r.URL.Query()["resource"], // RFC 8707: Can be repeated
 	}
 
-	// In production, you would:
-	// 1. Authenticate the user
-	// 2. Show authorization consent page
-	// 3. Get user approval
-	// For this example, we'll extract user ID from context or header
+	// State parameter is required for CSRF protection
+	if err := validateState(req.State); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrInvalidRequest, err.Error())
+		return
+	}
+
+	// Validate client ID
+	if req.ClientID == "" {
+		h.writeError(w, http.StatusBadRequest, ErrInvalidRequest, "client_id is required")
+		return
+	}
+
+	// Get client
+	client, err := h.server.store.GetClient(r.Context(), req.ClientID)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrInvalidClient, "invalid client_id")
+		return
+	}
+
+	// Validate redirect URI with exact matching
+	if err := validateRedirectURI(client.RedirectURIs, req.RedirectURI); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrInvalidRequest, err.Error())
+		return
+	}
+
+	// Enforce HTTPS for redirect URIs
+	if err := validateEndpointSecurity(req.RedirectURI); err != nil {
+		h.redirectWithError(w, r, req.RedirectURI, req.State, err)
+		return
+	}
+
+	// Validate response type
+	if req.ResponseType != "code" {
+		h.redirectWithError(w, r, req.RedirectURI, req.State,
+			fmt.Errorf("%s: only 'code' response_type is supported", ErrUnsupportedResponseType))
+		return
+	}
+
+	// PKCE is required for public clients
+	if client.IsPublic && req.CodeChallenge == "" {
+		h.redirectWithError(w, r, req.RedirectURI, req.State,
+			fmt.Errorf("%s: PKCE is required for public clients", ErrInvalidRequest))
+		return
+	}
+
+	// Validate PKCE if provided
+	if req.CodeChallenge != "" {
+		pkceValidator := NewPKCEValidator()
+		if err := pkceValidator.ValidateCodeChallenge(req.CodeChallenge, req.CodeChallengeMethod, client.IsPublic); err != nil {
+			h.redirectWithError(w, r, req.RedirectURI, req.State, err)
+			return
+		}
+	}
+
+	// Validate scopes
+	requestedScopes := parseScopes(req.Scope)
+	if err := validateScope(requestedScopes, client.Scopes); err != nil {
+		h.redirectWithError(w, r, req.RedirectURI, req.State, err)
+		return
+	}
+
+	// Get user ID (in production, this would come from user authentication)
 	userID := r.Header.Get("X-User-ID")
 	if userID == "" {
-		h.writeError(w, http.StatusUnauthorized, ErrAccessDenied, "user not authenticated")
+		h.redirectWithError(w, r, req.RedirectURI, req.State,
+			fmt.Errorf("%s: user not authenticated", ErrAccessDenied))
 		return
 	}
 
 	// Handle authorization request
 	redirectURL, err := h.server.HandleAuthorizationRequest(r.Context(), req, userID)
 	if err != nil {
-		// On error, redirect back with error
 		h.redirectWithError(w, r, req.RedirectURI, req.State, err)
 		return
 	}
@@ -329,8 +393,15 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/oauth/introspect", h.HandleIntrospection)
 	mux.HandleFunc("/oauth/revoke", h.HandleRevocation)
 
+	// RFC 7591: Dynamic Client Registration
+	mux.HandleFunc("/register", h.dynamicRegistrationHandler.HandleRegister)
+	mux.HandleFunc("/register/", h.dynamicRegistrationHandler.HandleClientConfiguration)
+
 	// RFC 8414: Authorization Server Metadata
 	mux.Handle("/.well-known/oauth-authorization-server", h.server.GetMetadataProvider())
+
+	// RFC 9728: Protected Resource Metadata (新增)
+	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 
 	// JWKS endpoint
 	mux.Handle("/.well-known/jwks.json", h.server.GetJWKSProvider())
@@ -350,8 +421,13 @@ func (h *Handler) RegisterRoutesWithPrefix(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/introspect", h.HandleIntrospection)
 	mux.HandleFunc(prefix+"/revoke", h.HandleRevocation)
 
+	// RFC 7591: Dynamic Client Registration
+	mux.HandleFunc("/register", h.dynamicRegistrationHandler.HandleRegister)
+	mux.HandleFunc("/register/", h.dynamicRegistrationHandler.HandleClientConfiguration)
+
 	// Metadata and JWKS at well-known locations (not prefixed)
 	mux.Handle("/.well-known/oauth-authorization-server", h.server.GetMetadataProvider())
+	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 	mux.Handle("/.well-known/jwks.json", h.server.GetJWKSProvider())
 }
 
@@ -366,8 +442,13 @@ func (h *Handler) RegisterRoutesWithOAuth(mux *http.ServeMux) {
 	mux.HandleFunc("/oauth/introspect", h.HandleIntrospection)
 	mux.HandleFunc("/oauth/revoke", h.HandleRevocation)
 
+	// RFC 7591: Dynamic Client Registration
+	mux.HandleFunc("/register", h.dynamicRegistrationHandler.HandleRegister)
+	mux.HandleFunc("/register/", h.dynamicRegistrationHandler.HandleClientConfiguration)
+
 	// Metadata and JWKS
 	mux.Handle("/.well-known/oauth-authorization-server", h.server.GetMetadataProvider())
+	mux.HandleFunc("/.well-known/oauth-protected-resource", h.server.GetMetadataProvider().ServeProtectedResourceMetadata)
 	mux.Handle("/.well-known/jwks.json", h.server.GetJWKSProvider())
 
 	if h.oauthClient != nil {

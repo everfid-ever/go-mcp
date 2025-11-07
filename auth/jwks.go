@@ -82,7 +82,6 @@ func NewJWKSProviderWithRSAKey(privateKey *rsa.PrivateKey, keyID string) *JWKSPr
 // generateJWKS creates the JWKS document
 func (jp *JWKSProvider) generateJWKS() {
 	if jp.algorithm == "RS256" && jp.publicKey != nil {
-		// Expose RSA public key for verification
 		jp.jwks = &JWKSet{
 			Keys: []JWK{
 				{
@@ -96,19 +95,8 @@ func (jp *JWKSProvider) generateJWKS() {
 			},
 		}
 	} else {
-		// For HMAC (HS256), we don't expose the symmetric key
-		// Clients must use introspection endpoint instead
 		jp.jwks = &JWKSet{
-			Keys: []JWK{
-				{
-					Kty: "oct",
-					Use: "sig",
-					Kid: jp.keyID,
-					Alg: "HS256",
-					// Note: Symmetric keys should NOT be exposed in JWKS
-					// Use introspection endpoint for token validation
-				},
-			},
+			Keys: []JWK{}, // empty for HS256
 		}
 	}
 }
@@ -132,6 +120,16 @@ func (jp *JWKSProvider) GetAlgorithm() string {
 func (jp *JWKSProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if jp.algorithm == "HS256" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":             "jwks_not_available",
+			"error_description": "JWKS endpoint is not available for HMAC-based tokens. Use token introspection endpoint instead.",
+		})
 		return
 	}
 

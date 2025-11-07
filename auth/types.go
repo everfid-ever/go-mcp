@@ -157,4 +157,5 @@ const (
 	ErrUnsupportedResponseType = "unsupported_response_type"
 	ErrServerError             = "server_error"
 	ErrTemporarilyUnavailable  = "temporarily_unavailable"
+	ErrInvalidToken            = "invalid_token"
 )

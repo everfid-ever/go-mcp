@@ -21,7 +21,7 @@ type OAuthClient struct {
 	config        *ThirdPartyOAuthConfig
 	mcpTokenGen   *TokenGenerator
 	store         Store
-	stateStore    map[string]*OAuthState // In-memory state storage (use Redis in production)
+	stateStore    map[string]*OAuthState // In-memory state storage
 	httpClient    *http.Client
 	encryptionKey []byte // For encrypting sensitive tokens
 }
@@ -111,7 +111,7 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Parse scopes
-	mcpScopes := parseMcpScopes(mcpScope)
+	mcpScopes := parseScopes(mcpScope)
 
 	// Generate state for CSRF protection (for third-party OAuth)
 	state, err := generateRandomState()
@@ -471,19 +471,4 @@ func generateRandomState() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func parseMcpScopes(scopeString string) []string {
-	if scopeString == "" {
-		return []string{}
-	}
-	scopes := strings.Split(scopeString, " ")
-	result := make([]string, 0, len(scopes))
-	for _, scope := range scopes {
-		trimmed := strings.TrimSpace(scope)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }

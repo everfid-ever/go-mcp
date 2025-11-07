@@ -1,7 +1,5 @@
 package auth
 
-import "strings"
-
 // ThirdPartyOAuthConfig holds configuration for a third-party OAuth provider
 type ThirdPartyOAuthConfig struct {
 	// Provider information
@@ -43,24 +41,4 @@ type ThirdPartyUserInfo struct {
 	Name     string                 `json:"name,omitempty"`
 	Username string                 `json:"preferred_username,omitempty"`
 	Claims   map[string]interface{} `json:"-"` // Additional claims
-}
-
-// ParseScopes parses a space-separated scope string into a slice
-func ParseScopes(scopeString string) []string {
-	if scopeString == "" {
-		return []string{}
-	}
-
-	scopes := strings.Split(scopeString, " ")
-
-	// Remove empty strings
-	result := make([]string, 0, len(scopes))
-	for _, scope := range scopes {
-		trimmed := strings.TrimSpace(scope)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-
-	return result
 }

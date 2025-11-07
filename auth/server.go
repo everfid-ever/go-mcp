@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -494,11 +493,4 @@ func (s *Server) isGrantTypeSupported(grantType GrantType) bool {
 		}
 	}
 	return false
-}
-
-func parseScopes(scopeString string) []string {
-	if scopeString == "" {
-		return []string{}
-	}
-	return strings.Split(scopeString, " ")
 }
