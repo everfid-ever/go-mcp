@@ -2,8 +2,10 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -12,8 +14,11 @@ import (
 
 // TokenGenerator handles token generation and validation
 type TokenGenerator struct {
-	// JWT signing key
+	// JWT signing
 	SigningKey []byte
+	PrivateKey *rsa.PrivateKey // For RS256
+	Algorithm  string          // "HS256" or "RS256"
+
 	// Issuer identifier
 	Issuer string
 	// Key ID for JWKS
@@ -39,9 +44,23 @@ func NewTokenGenerator(signingKey []byte, issuer string) *TokenGenerator {
 		SigningKey:          signingKey,
 		Issuer:              issuer,
 		KeyID:               GenerateKeyID(signingKey),
-		AccessTokenTTL:      15 * time.Minute,    // OAuth 2.1 recommendation
-		RefreshTokenTTL:     30 * 24 * time.Hour, // 30 days
-		RotateRefreshTokens: true,                // OAuth 2.1 best practice
+		Algorithm:           "HS256",
+		AccessTokenTTL:      15 * time.Minute,
+		RefreshTokenTTL:     30 * 24 * time.Hour,
+		RotateRefreshTokens: true,
+	}
+}
+
+// NewTokenGeneratorWithRSA creates a token generator with RS256
+func NewTokenGeneratorWithRSA(privateKey *rsa.PrivateKey, issuer string) *TokenGenerator {
+	return &TokenGenerator{
+		PrivateKey:          privateKey,
+		Issuer:              issuer,
+		KeyID:               GenerateRSAKeyID(&privateKey.PublicKey),
+		Algorithm:           "RS256",
+		AccessTokenTTL:      15 * time.Minute,
+		RefreshTokenTTL:     30 * 24 * time.Hour,
+		RotateRefreshTokens: true,
 	}
 }
 
@@ -55,7 +74,7 @@ func GenerateRandomToken(length int) (string, error) {
 }
 
 // GenerateAccessToken generates a new JWT access token with resource indicators
-func (g *TokenGenerator) GenerateAccessToken(clientID, userID string, scopes []string, resources []string) (*AccessToken, error) {
+func (g *TokenGenerator) GenerateAccessToken(clientID, userID string, scopes []string, resources ...[]string) (*AccessToken, error) {
 	now := time.Now()
 	expiresAt := now.Add(g.AccessTokenTTL)
 
@@ -65,11 +84,17 @@ func (g *TokenGenerator) GenerateAccessToken(clientID, userID string, scopes []s
 		return nil, fmt.Errorf("failed to generate token ID: %w", err)
 	}
 
+	// Flatten resources parameter
+	var resourceList []string
+	if len(resources) > 0 {
+		resourceList = resources[0]
+	}
+
 	// RFC 8707: Set audience to resource indicators
 	audience := jwt.ClaimStrings{clientID}
-	if len(resources) > 0 {
-		audience = make(jwt.ClaimStrings, len(resources))
-		copy(audience, resources)
+	if len(resourceList) > 0 {
+		audience = make(jwt.ClaimStrings, len(resourceList))
+		copy(audience, resourceList)
 	}
 
 	// Create JWT claims
@@ -88,11 +113,20 @@ func (g *TokenGenerator) GenerateAccessToken(clientID, userID string, scopes []s
 		TokenID:  tokenID,
 	}
 
-	// Create and sign token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	token.Header["kid"] = g.KeyID // Add Key ID to header
+	// Create and sign token based on algorithm
+	var token *jwt.Token
+	var tokenString string
 
-	tokenString, err := token.SignedString(g.SigningKey)
+	if g.Algorithm == "RS256" {
+		token = jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		token.Header["kid"] = g.KeyID
+		tokenString, err = token.SignedString(g.PrivateKey)
+	} else {
+		token = jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		token.Header["kid"] = g.KeyID
+		tokenString, err = token.SignedString(g.SigningKey)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign token: %w", err)
 	}
@@ -103,16 +137,22 @@ func (g *TokenGenerator) GenerateAccessToken(clientID, userID string, scopes []s
 		ClientID:  clientID,
 		UserID:    userID,
 		Scopes:    scopes,
-		Resources: resources,
+		Resources: resourceList,
 		ExpiresAt: expiresAt,
 		CreatedAt: now,
 	}, nil
 }
 
 // GenerateRefreshToken generates a new refresh token
-func (g *TokenGenerator) GenerateRefreshToken(clientID, userID string, scopes []string, resources []string) (*RefreshToken, error) {
+func (g *TokenGenerator) GenerateRefreshToken(clientID, userID string, scopes []string, resources ...[]string) (*RefreshToken, error) {
 	now := time.Now()
 	expiresAt := now.Add(g.RefreshTokenTTL)
+
+	// Flatten resources parameter
+	var resourceList []string
+	if len(resources) > 0 {
+		resourceList = resources[0]
+	}
 
 	// Generate opaque token
 	tokenString, err := GenerateRandomToken(32)
@@ -125,7 +165,7 @@ func (g *TokenGenerator) GenerateRefreshToken(clientID, userID string, scopes []
 		ClientID:      clientID,
 		UserID:        userID,
 		Scopes:        scopes,
-		Resources:     resources,
+		Resources:     resourceList,
 		ExpiresAt:     expiresAt,
 		CreatedAt:     now,
 		RotationCount: 0,
@@ -142,10 +182,18 @@ func GenerateAuthorizationCode() (string, error) {
 func (g *TokenGenerator) ValidateAccessToken(tokenString string) (*TokenClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &TokenClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// Verify signing method
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		if g.Algorithm == "RS256" {
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			// Return public key for verification
+			return &g.PrivateKey.PublicKey, nil
+		} else {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return g.SigningKey, nil
 		}
-		return g.SigningKey, nil
 	})
 
 	if err != nil {
@@ -197,4 +245,12 @@ func CreateTokenResponse(accessToken *AccessToken, refreshToken *RefreshToken) *
 	}
 
 	return response
+}
+
+// GenerateRSAKeyID creates a key ID from RSA public key
+func GenerateRSAKeyID(publicKey *rsa.PublicKey) string {
+	n := publicKey.N.Bytes()
+	e := big.NewInt(int64(publicKey.E)).Bytes()
+	combined := append(n, e...)
+	return GenerateKeyID(combined)
 }

@@ -382,7 +382,6 @@ func (s *Server) generateTokenPair(
 	scopes, resources []string,
 	includeRefreshToken bool,
 ) (*TokenResponse, error) {
-	// Generate access token
 	accessToken, err := s.tokenGenerator.GenerateAccessToken(clientID, userID, scopes, resources)
 	if err != nil {
 		return nil, fmt.Errorf("%s: failed to generate access token", ErrServerError)
@@ -395,7 +394,6 @@ func (s *Server) generateTokenPair(
 
 	var refreshToken *RefreshToken
 	if includeRefreshToken {
-		// Generate refresh token
 		refreshToken, err = s.tokenGenerator.GenerateRefreshToken(clientID, userID, scopes, resources)
 		if err != nil {
 			return nil, fmt.Errorf("%s: failed to generate refresh token", ErrServerError)

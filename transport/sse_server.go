@@ -211,8 +211,18 @@ func (t *sseServerTransport) SetSessionManager(manager sessionManager) {
 	t.sessionManager = manager
 }
 
-// handleSSE handles incoming SSE connections from clients and sends messages to them.
 func (t *sseServerTransport) handleSSE(w http.ResponseWriter, r *http.Request) {
+	if t.authMiddleware != nil {
+		t.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.handleSSECore(w, r)
+		})).ServeHTTP(w, r)
+		return
+	}
+	t.handleSSECore(w, r)
+}
+
+// handleSSECore handles incoming SSE connections from clients and sends messages to them.
+func (t *sseServerTransport) handleSSECore(w http.ResponseWriter, r *http.Request) {
 	defer pkg.RecoverWithFunc(func(_ any) {
 		t.writeError(w, http.StatusInternalServerError, "Internal server error")
 	})

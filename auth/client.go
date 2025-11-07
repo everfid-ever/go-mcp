@@ -2,9 +2,12 @@ package auth
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,14 +18,15 @@ import (
 
 // OAuthClient handles OAuth flow with third-party providers
 type OAuthClient struct {
-	config      *ThirdPartyOAuthConfig
-	mcpTokenGen *TokenGenerator
-	store       Store
-	stateStore  map[string]*OAuthState // In-memory state storage (use Redis in production)
-	httpClient  *http.Client
+	config        *ThirdPartyOAuthConfig
+	mcpTokenGen   *TokenGenerator
+	store         Store
+	stateStore    map[string]*OAuthState // In-memory state storage (use Redis in production)
+	httpClient    *http.Client
+	encryptionKey []byte // For encrypting sensitive tokens
 }
 
-// OAuthState stores temporary OAuth flow state
+// OAuthState stores temporary OAuth flow state - FIXED: Added MCP client parameters
 type OAuthState struct {
 	State           string
 	CodeVerifier    string // For PKCE
@@ -31,6 +35,15 @@ type OAuthState struct {
 	OriginalRequest string // Store original MCP client callback
 	CreatedAt       time.Time
 	ExpiresAt       time.Time
+
+	// MCP Client parameters - NEW
+	MCPClientID            string
+	MCPRedirectURI         string
+	MCPScopes              []string
+	MCPResources           []string
+	MCPState               string
+	MCPCodeChallenge       string
+	MCPCodeChallengeMethod string
 }
 
 // NewOAuthClient creates a new OAuth client for third-party auth
@@ -39,33 +52,75 @@ func NewOAuthClient(
 	mcpTokenGen *TokenGenerator,
 	store Store,
 ) *OAuthClient {
+	// Generate encryption key for sensitive data (in production, load from secure config)
+	encryptionKey := make([]byte, 32)
+	if _, err := rand.Read(encryptionKey); err != nil {
+		panic(fmt.Sprintf("failed to generate encryption key: %v", err))
+	}
+
 	return &OAuthClient{
-		config:      config,
-		mcpTokenGen: mcpTokenGen,
-		store:       store,
-		stateStore:  make(map[string]*OAuthState),
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		config:        config,
+		mcpTokenGen:   mcpTokenGen,
+		store:         store,
+		stateStore:    make(map[string]*OAuthState),
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		encryptionKey: encryptionKey,
 	}
 }
 
 // InitiateOAuthFlow handles the initial OAuth request from MCP Client
-// This corresponds to "Initial OAuth Request" in your diagram
+// FIXED: Now properly captures MCP client parameters
 func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) {
-	// Extract MCP client's callback URL (where to redirect after OAuth completes)
-	mcpClientCallback := r.URL.Query().Get("redirect_uri")
-	if mcpClientCallback == "" {
+	// Extract MCP client parameters
+	mcpClientID := r.URL.Query().Get("client_id")
+	mcpRedirectURI := r.URL.Query().Get("redirect_uri")
+	mcpState := r.URL.Query().Get("state")
+	mcpScope := r.URL.Query().Get("scope")
+	mcpCodeChallenge := r.URL.Query().Get("code_challenge")
+	mcpCodeChallengeMethod := r.URL.Query().Get("code_challenge_method")
+	mcpResources := r.URL.Query()["resource"] // Can be repeated
+
+	// Validate required MCP parameters
+	if mcpClientID == "" {
+		http.Error(w, "Missing client_id parameter", http.StatusBadRequest)
+		return
+	}
+	if mcpRedirectURI == "" {
 		http.Error(w, "Missing redirect_uri parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Generate state for CSRF protection
+	// Validate MCP client exists
+	client, err := c.store.GetClient(r.Context(), mcpClientID)
+	if err != nil {
+		http.Error(w, "Invalid client_id", http.StatusBadRequest)
+		return
+	}
+
+	// Validate redirect URI
+	validRedirect := false
+	for _, allowed := range client.RedirectURIs {
+		if mcpRedirectURI == allowed {
+			validRedirect = true
+			break
+		}
+	}
+	if !validRedirect {
+		http.Error(w, "Invalid redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	// Parse scopes
+	mcpScopes := parseMcpScopes(mcpScope)
+
+	// Generate state for CSRF protection (for third-party OAuth)
 	state, err := generateRandomState()
 	if err != nil {
 		http.Error(w, "Failed to generate state", http.StatusInternalServerError)
 		return
 	}
 
-	// Generate PKCE challenge if enabled
+	// Generate PKCE challenge for third-party OAuth if enabled
 	var codeVerifier, codeChallenge string
 	if c.config.UsePKCE {
 		codeVerifier, codeChallenge, err = GenerateCodeVerifierAndChallenge()
@@ -75,15 +130,23 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Store state for validation later
+	// Store state with MCP client parameters
 	oauthState := &OAuthState{
-		State:           state,
-		CodeVerifier:    codeVerifier,
-		CodeChallenge:   codeChallenge,
-		RedirectURI:     c.config.RedirectURI,
-		OriginalRequest: mcpClientCallback,
-		CreatedAt:       time.Now(),
-		ExpiresAt:       time.Now().Add(10 * time.Minute),
+		State:         state,
+		CodeVerifier:  codeVerifier,
+		CodeChallenge: codeChallenge,
+		RedirectURI:   c.config.RedirectURI,
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(10 * time.Minute),
+
+		// MCP Client parameters
+		MCPClientID:            mcpClientID,
+		MCPRedirectURI:         mcpRedirectURI,
+		MCPScopes:              mcpScopes,
+		MCPResources:           mcpResources,
+		MCPState:               mcpState,
+		MCPCodeChallenge:       mcpCodeChallenge,
+		MCPCodeChallengeMethod: mcpCodeChallengeMethod,
 	}
 	c.stateStore[state] = oauthState
 
@@ -95,7 +158,7 @@ func (c *OAuthClient) InitiateOAuthFlow(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleCallback handles the callback from third-party OAuth provider
-// This corresponds to "Redirect to MCP Server callback" in your diagram
+// FIXED: Now generates proper MCP authorization code with all parameters
 func (c *OAuthClient) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Extract authorization code and state
 	code := r.URL.Query().Get("code")
@@ -138,36 +201,145 @@ func (c *OAuthClient) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get user info from third-party (optional but recommended)
+	// Get user info from third-party
 	userInfo, err := c.getUserInfo(thirdPartyToken.AccessToken)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get user info: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Generate MCP-bound token
-	mcpToken, err := c.generateMCPToken(userInfo, thirdPartyToken)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to generate MCP token: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Store the mapping between MCP token and third-party token
-	if err := c.storeMCPToken(r.Context(), mcpToken, thirdPartyToken, userInfo); err != nil {
-		http.Error(w, "Failed to store token", http.StatusInternalServerError)
-		return
-	}
-
-	// Generate MCP authorization code for the client
-	mcpAuthCode, err := c.generateMCPAuthorizationCode(userInfo.Subject, mcpToken)
+	// Generate MCP authorization code with proper parameters
+	mcpAuthCode, err := c.generateMCPAuthorizationCode(r.Context(), oauthState, userInfo, thirdPartyToken)
 	if err != nil {
 		http.Error(w, "Failed to generate MCP auth code", http.StatusInternalServerError)
 		return
 	}
 
-	// Redirect back to MCP client with MCP authorization code
-	redirectURL := c.buildMCPClientRedirect(oauthState.OriginalRequest, mcpAuthCode, state)
+	// Redirect back to MCP client with MCP authorization code and original state
+	redirectURL := c.buildMCPClientRedirect(oauthState.MCPRedirectURI, mcpAuthCode, oauthState.MCPState)
 	http.Redirect(w, r, redirectURL, http.StatusFound)
+}
+
+// generateMCPAuthorizationCode generates a proper MCP authorization code
+// FIXED: Now includes all MCP client parameters
+func (c *OAuthClient) generateMCPAuthorizationCode(
+	ctx context.Context,
+	oauthState *OAuthState,
+	userInfo *ThirdPartyUserInfo,
+	thirdPartyToken *ThirdPartyTokenResponse,
+) (string, error) {
+	code, err := GenerateAuthorizationCode()
+	if err != nil {
+		return "", err
+	}
+
+	// Set default PKCE method if challenge provided
+	challengeMethod := oauthState.MCPCodeChallengeMethod
+	if challengeMethod == "" && oauthState.MCPCodeChallenge != "" {
+		challengeMethod = CodeChallengeMethodPlain
+	}
+
+	// Encrypt third-party tokens before storing
+	encryptedAccessToken, err := c.encryptToken(thirdPartyToken.AccessToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt access token: %w", err)
+	}
+
+	encryptedRefreshToken := ""
+	if thirdPartyToken.RefreshToken != "" {
+		encryptedRefreshToken, err = c.encryptToken(thirdPartyToken.RefreshToken)
+		if err != nil {
+			return "", fmt.Errorf("failed to encrypt refresh token: %w", err)
+		}
+	}
+
+	// Create authorization code with proper MCP client binding
+	authCode := &AuthorizationCode{
+		Code:                code,
+		ClientID:            oauthState.MCPClientID, // FIXED: Use MCP client ID
+		UserID:              userInfo.Subject,
+		RedirectURI:         oauthState.MCPRedirectURI,   // FIXED: Use MCP redirect URI
+		Scopes:              oauthState.MCPScopes,        // FIXED: Use MCP scopes
+		Resources:           oauthState.MCPResources,     // FIXED: Use MCP resources
+		CodeChallenge:       oauthState.MCPCodeChallenge, // FIXED: Use MCP PKCE
+		CodeChallengeMethod: challengeMethod,
+		ExpiresAt:           time.Now().Add(5 * time.Minute),
+		CreatedAt:           time.Now(),
+		Used:                false,
+		Metadata: map[string]interface{}{
+			"third_party_provider":          c.config.ProviderName,
+			"third_party_token_encrypted":   encryptedAccessToken,  // FIXED: Encrypted
+			"third_party_refresh_encrypted": encryptedRefreshToken, // FIXED: Encrypted
+			"third_party_expires":           time.Now().Add(time.Duration(thirdPartyToken.ExpiresIn) * time.Second).Unix(),
+			"user_email":                    userInfo.Email,
+			"user_name":                     userInfo.Name,
+		},
+	}
+
+	if err := c.store.SaveAuthorizationCode(ctx, authCode); err != nil {
+		return "", err
+	}
+
+	return code, nil
+}
+
+// encryptToken encrypts sensitive tokens using AES-GCM
+func (c *OAuthClient) encryptToken(plaintext string) (string, error) {
+	if plaintext == "" {
+		return "", nil
+	}
+
+	block, err := aes.NewCipher(c.encryptionKey)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decryptToken decrypts sensitive tokens
+func (c *OAuthClient) decryptToken(encrypted string) (string, error) {
+	if encrypted == "" {
+		return "", nil
+	}
+
+	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return "", err
+	}
+
+	block, err := aes.NewCipher(c.encryptionKey)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", errors.New("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plaintext), nil
 }
 
 // exchangeCodeForToken exchanges authorization code for access token
@@ -262,58 +434,6 @@ func (c *OAuthClient) getUserInfo(accessToken string) (*ThirdPartyUserInfo, erro
 	return &userInfo, nil
 }
 
-// generateMCPToken generates an MCP access token bound to third-party token
-func (c *OAuthClient) generateMCPToken(userInfo *ThirdPartyUserInfo, thirdPartyToken *ThirdPartyTokenResponse) (*AccessToken, error) {
-	// Use third-party user ID as subject
-	scopes := ParseScopes(thirdPartyToken.Scope)
-
-	return c.mcpTokenGen.GenerateAccessToken(
-		c.config.ClientID, // MCP client ID
-		userInfo.Subject,  // User ID from third-party
-		scopes,
-	)
-}
-
-// generateMCPAuthorizationCode generates an MCP authorization code
-func (c *OAuthClient) generateMCPAuthorizationCode(userID string, mcpToken *AccessToken) (string, error) {
-	code, err := GenerateAuthorizationCode()
-	if err != nil {
-		return "", err
-	}
-
-	// Store authorization code in your store
-	authCode := &AuthorizationCode{
-		Code:      code,
-		ClientID:  c.config.ClientID,
-		UserID:    userID,
-		Scopes:    mcpToken.Scopes,
-		ExpiresAt: time.Now().Add(5 * time.Minute),
-		CreatedAt: time.Now(),
-		Used:      false,
-	}
-
-	if err := c.store.SaveAuthorizationCode(context.Background(), authCode); err != nil {
-		return "", err
-	}
-
-	return code, nil
-}
-
-// storeMCPToken stores the MCP token and its relationship to third-party token
-func (c *OAuthClient) storeMCPToken(ctx context.Context, mcpToken *AccessToken, thirdPartyToken *ThirdPartyTokenResponse, userInfo *ThirdPartyUserInfo) error {
-	// Store third-party token info in metadata
-	mcpToken.Metadata = map[string]interface{}{
-		"third_party_provider": c.config.ProviderName,
-		"third_party_token":    thirdPartyToken.AccessToken,
-		"third_party_refresh":  thirdPartyToken.RefreshToken,
-		"third_party_expires":  time.Now().Add(time.Duration(thirdPartyToken.ExpiresIn) * time.Second).Unix(),
-		"user_email":           userInfo.Email,
-		"user_name":            userInfo.Name,
-	}
-
-	return c.store.SaveAccessToken(ctx, mcpToken)
-}
-
 // buildAuthorizationURL builds the third-party authorization URL
 func (c *OAuthClient) buildAuthorizationURL(state, codeChallenge string) string {
 	params := url.Values{}
@@ -332,11 +452,14 @@ func (c *OAuthClient) buildAuthorizationURL(state, codeChallenge string) string 
 }
 
 // buildMCPClientRedirect builds redirect URL back to MCP client
-func (c *OAuthClient) buildMCPClientRedirect(mcpClientCallback, authCode, state string) string {
+// FIXED: Use MCP client's original state
+func (c *OAuthClient) buildMCPClientRedirect(mcpClientCallback, authCode, mcpState string) string {
 	redirectURL, _ := url.Parse(mcpClientCallback)
 	query := redirectURL.Query()
 	query.Set("code", authCode)
-	query.Set("state", state)
+	if mcpState != "" {
+		query.Set("state", mcpState) // FIXED: Return MCP client's state
+	}
 	redirectURL.RawQuery = query.Encode()
 	return redirectURL.String()
 }
@@ -348,4 +471,19 @@ func generateRandomState() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func parseMcpScopes(scopeString string) []string {
+	if scopeString == "" {
+		return []string{}
+	}
+	scopes := strings.Split(scopeString, " ")
+	result := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		trimmed := strings.TrimSpace(scope)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }

@@ -2,9 +2,12 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 )
 
@@ -26,16 +29,51 @@ type JWKSet struct {
 
 // JWKSProvider manages JWKS endpoint
 type JWKSProvider struct {
-	signingKey []byte
+	privateKey *rsa.PrivateKey // For RS256
+	publicKey  *rsa.PublicKey  // For RS256
+	signingKey []byte          // For HS256 (backward compatibility)
 	keyID      string
 	jwks       *JWKSet
+	algorithm  string // "RS256" or "HS256"
 }
 
 // NewJWKSProvider creates a new JWKS provider
+// For backward compatibility, it uses HS256 by default
 func NewJWKSProvider(signingKey []byte, keyID string) *JWKSProvider {
 	provider := &JWKSProvider{
 		signingKey: signingKey,
 		keyID:      keyID,
+		algorithm:  "HS256",
+	}
+	provider.generateJWKS()
+	return provider
+}
+
+// NewJWKSProviderWithRSA creates a JWKS provider with RSA support
+func NewJWKSProviderWithRSA(keyID string) (*JWKSProvider, error) {
+	// Generate RSA key pair
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	provider := &JWKSProvider{
+		privateKey: privateKey,
+		publicKey:  &privateKey.PublicKey,
+		keyID:      keyID,
+		algorithm:  "RS256",
+	}
+	provider.generateJWKS()
+	return provider, nil
+}
+
+// NewJWKSProviderWithRSAKey creates a JWKS provider with existing RSA key
+func NewJWKSProviderWithRSAKey(privateKey *rsa.PrivateKey, keyID string) *JWKSProvider {
+	provider := &JWKSProvider{
+		privateKey: privateKey,
+		publicKey:  &privateKey.PublicKey,
+		keyID:      keyID,
+		algorithm:  "RS256",
 	}
 	provider.generateJWKS()
 	return provider
@@ -43,26 +81,51 @@ func NewJWKSProvider(signingKey []byte, keyID string) *JWKSProvider {
 
 // generateJWKS creates the JWKS document
 func (jp *JWKSProvider) generateJWKS() {
-	// For HMAC (HS256), we typically don't expose the symmetric key
-	// This is a placeholder - in production with RS256, you'd expose the public key
-	jp.jwks = &JWKSet{
-		Keys: []JWK{
-			{
-				Kty: "oct",
-				Use: "sig",
-				Kid: jp.keyID,
-				Alg: "HS256",
-				// Note: Symmetric keys should NOT be exposed in JWKS
-				// This is here for documentation purposes only
-				// In production, use RS256/ES256 with public/private key pairs
+	if jp.algorithm == "RS256" && jp.publicKey != nil {
+		// Expose RSA public key for verification
+		jp.jwks = &JWKSet{
+			Keys: []JWK{
+				{
+					Kty: "RSA",
+					Use: "sig",
+					Kid: jp.keyID,
+					Alg: "RS256",
+					N:   base64.RawURLEncoding.EncodeToString(jp.publicKey.N.Bytes()),
+					E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(jp.publicKey.E)).Bytes()),
+				},
 			},
-		},
+		}
+	} else {
+		// For HMAC (HS256), we don't expose the symmetric key
+		// Clients must use introspection endpoint instead
+		jp.jwks = &JWKSet{
+			Keys: []JWK{
+				{
+					Kty: "oct",
+					Use: "sig",
+					Kid: jp.keyID,
+					Alg: "HS256",
+					// Note: Symmetric keys should NOT be exposed in JWKS
+					// Use introspection endpoint for token validation
+				},
+			},
+		}
 	}
 }
 
 // GetJWKS returns the JWKS document
 func (jp *JWKSProvider) GetJWKS() *JWKSet {
 	return jp.jwks
+}
+
+// GetPrivateKey returns the RSA private key (for signing)
+func (jp *JWKSProvider) GetPrivateKey() *rsa.PrivateKey {
+	return jp.privateKey
+}
+
+// GetAlgorithm returns the signing algorithm
+func (jp *JWKSProvider) GetAlgorithm() string {
+	return jp.algorithm
 }
 
 // ServeHTTP handles the JWKS endpoint
